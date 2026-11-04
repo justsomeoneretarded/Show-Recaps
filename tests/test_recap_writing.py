@@ -199,8 +199,12 @@ def test_general_edit_repairs_pitch_and_rejects_unsupported_statement(tmp_path):
     model.draft = draft
     def edit(data):
         if data["purpose"] == "ending":
+            event = next(event for event in data["events"] if event["ending_state"])
             return {"title": "Ivo's position", "paragraphs": [
-                {**p, "supported": True, "reason": ""} for p in data["draft"]["paragraphs"]]}
+                {"text": event["summary"], "event_ids": [event["id"]], "delivery": "calm",
+                 "supported": True, "reason": ""},
+                {"text": "Mara dies.", "event_ids": [event["id"]], "delivery": "dramatic",
+                 "supported": False, "reason": "The finale evidence establishes no death."}]}
         event = data["events"][0]
         return {"title": "A way through the gate", "paragraphs": [
             {"text": "Mara opens the gate and gives Ivo a way out.", "event_ids": [event["id"]],
@@ -210,6 +214,8 @@ def test_general_edit_repairs_pitch_and_rejects_unsupported_statement(tmp_path):
     model.edit = edit
     script = write_recap("season", spec(2), bundle, ledger, tmp_path / "script", writer=model)
     assert "gives Ivo a way out" in spoken(script)
+    ending = next(section for section in script["sections"] if section["kind"] == "ending")
+    assert ending["paragraphs"] == ["At the end, Ivo is free while Mara remains inside."]
     assert all(term not in spoken(script).lower() for term in ["netflix", "number one", "must-watch", "mara dies"])
     assert any("EDIT_AND_VERIFY_RECAP" in task for task, _, _ in model.calls)
     assert_valid_citations(script, bundle, ledger, {1})
