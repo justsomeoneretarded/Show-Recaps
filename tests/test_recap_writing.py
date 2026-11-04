@@ -4,6 +4,7 @@ import json
 import pytest
 
 from movie_pipeline.core import PipelineError
+from recap_pipeline.models import RecapSpec, validate_script_scope
 from recap_pipeline.writing import (
     MAX_EPISODES_PER_BATCH, MAX_EVENT_CHARS, RecapWriter, build_ledger, write_recap,
 )
@@ -499,3 +500,46 @@ def test_earlier_context_alone_cannot_satisfy_a_later_season_story(tmp_path):
     assert any(event["season"] == 2 and event["ending_state"] for event in ledger["events"])
     with pytest.raises(PipelineError, match=r"required season\(s\): 2"):
         write_recap("series", spec(3), bundle, ledger, tmp_path / "script", writer=model)
+
+
+@pytest.mark.parametrize("kind", ["season", "series"])
+@pytest.mark.parametrize("upcoming", [2, 3])
+def test_written_recap_and_its_cutoff_outro_pass_final_scope_validation(tmp_path, kind, upcoming):
+    bundle, model = bundle_with_seasons(upcoming - 1, 1), Model()
+    request = RecapSpec(show_title="The Gate", premiere_year=2021, upcoming_season=upcoming)
+    ledger = build_ledger(bundle, tmp_path / "ledger", writer=model)
+    output = write_recap(kind, request, bundle, ledger, tmp_path / "script", writer=model)
+    expected = {upcoming - 1} if kind == "season" else set(range(1, upcoming))
+    assert validate_script_scope(output, request, bundle) == expected
+    outro = next(section for section in output["sections"] if section["kind"] == "outro")
+    assert outro["paragraphs"] == [f"That is where the story stands before season {upcoming}."]
+    assert_valid_citations(output, bundle, ledger, expected)
+
+
+@pytest.mark.parametrize("orientation", ["Before season 2", "Ahead of season two"])
+def test_supported_cutoff_orientation_survives_editor_and_final_validation(tmp_path, orientation):
+    bundle, model = bundle_with_seasons(1, 1), Model()
+    request = RecapSpec(show_title="The Gate", premiere_year=2021, upcoming_season=2)
+    ledger = build_ledger(bundle, tmp_path / "ledger", writer=model)
+    model.edit = lambda data: {"title": data["draft"]["title"], "paragraphs": [
+        {**paragraph, "text": orientation + ", " + paragraph["text"],
+         "supported": True, "reason": ""} for paragraph in data["draft"]["paragraphs"]]}
+    output = write_recap("season", request, bundle, ledger, tmp_path / "script", writer=model)
+    assert orientation in spoken(output)
+    assert validate_script_scope(output, request, bundle) == {1}
+    assert_valid_citations(output, bundle, ledger, {1})
+
+
+@pytest.mark.parametrize("text", [
+    "In season two, Mara escapes.",
+    "Before season 3, Mara escapes.",
+    "Before season 2, S02E01 resolves the conflict.",
+    "Ahead of season two, in season 2 Mara escapes.",
+])
+def test_editor_supported_flag_cannot_authorize_future_scope(tmp_path, text):
+    bundle, model = bundle_with_seasons(1, 1), Model()
+    ledger = build_ledger(bundle, tmp_path / "ledger", writer=model)
+    model.edit = lambda data: {"title": "Future plot", "paragraphs": [
+        {**data["draft"]["paragraphs"][0], "text": text, "supported": True, "reason": ""}]}
+    with pytest.raises(PipelineError, match="No verified story narration"):
+        write_recap("season", spec(2), bundle, ledger, tmp_path / "script", writer=model)

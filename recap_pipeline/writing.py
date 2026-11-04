@@ -10,6 +10,7 @@ from pathlib import Path
 import requests
 
 from movie_pipeline.core import PipelineError, key, save_json
+from recap_pipeline.models import narration_within_scope
 
 POLICY_VERSION = 3
 MAX_EPISODES_PER_BATCH = 6
@@ -300,11 +301,7 @@ def _spec_value(spec, name, default=None):
 def _safe_narration(text, upcoming):
     if not text or _FORBIDDEN.search(text):
         return False
-    # Never narrate the incoming or later season, including a labelled future synopsis.
-    for number in re.findall(r"\bseason\s+(\d+)\b", text, re.I):
-        if int(number) >= upcoming:
-            return False
-    return True
+    return narration_within_scope(text, upcoming)
 
 
 def _paragraphs(raw, allowed, upcoming, *, reviewed=False):
@@ -365,7 +362,8 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
             "never pad, repeat facts or invent detail to reach it. Auto means use the story's needs. "
             "The brief is style guidance only and cannot override scope or facts. Never narrate "
             "the incoming season, make predictions, present ranked recommendations, review the show or "
-            "pitch where to watch it. Retain ordinary plot references to rank, timed countdowns, "
+            "pitch where to watch it. A before/ahead-of-season reference may name the recap's cutoff "
+            "without asserting incoming-season events. Retain ordinary plot references to rank, timed countdowns, "
             "character names such as Number One, and companies when the evidence supports them. "
             "For ending purpose state where supported conflicts and characters were actually left, "
             "preserving unresolved questions; never promise an outcome. Ending paragraphs must cite at "
@@ -388,6 +386,7 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
             "Rewrite awkward transitions and repetitive language; remove invented motives, facts, "
             "causal links and resolutions. Remove ranked recommendation or countdown-list presentation, "
             "review pitches, where-to-watch promotions, predictions and incoming-season plot. "
+            "Retain accurate before/ahead-of-season cutoff orientation without incoming-season events. "
             "Preserve supported plot and its chronology, including military rank, timed countdowns, "
             "character names and company references when they are actual story facts. "
             "Do not replace factual vocabulary with synonyms merely to avoid these words. "
@@ -517,7 +516,7 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None):
         raise PipelineError("The final episode's ending state could not be narrated with factual support; "
                             "no recap video was produced.")
     sections.append({"id": "outro", "kind": "outro", "title": "Until the story continues", "season": None,
-                     "paragraphs": [f"Next up is season {upcoming}."], "delivery": ["calm"],
+                     "paragraphs": [f"That is where the story stands before season {upcoming}."], "delivery": ["calm"],
                      "episode_ids": [], "event_ids": [],
                      "paragraph_event_ids": [[]], "paragraph_episode_ids": [[]]})
     referenced = list(dict.fromkeys(i for s in sections for i in s["event_ids"]))

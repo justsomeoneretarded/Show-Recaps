@@ -184,3 +184,51 @@ def test_prior_context_and_current_story_together_cover_the_later_season():
         delivery=["normal", "normal"],
     )
     assert validate_script_scope(data, request(), research()) == {1, 2}
+
+
+@pytest.mark.parametrize("kind", ["intro", "outro", "story", "ending"])
+@pytest.mark.parametrize("text", [
+    "Here is where the story stands before season 3.",
+    "Ahead of season three, the story so far.",
+    "The recap stops before the incoming season 3.",
+    "Before the upcoming season three, these are the completed events.",
+])
+def test_incoming_season_cutoff_is_orientation_in_every_section(kind, text):
+    data = script()
+    if kind in ("intro", "outro"):
+        section = {"id": kind, "kind": kind, "season": None,
+                   "paragraphs": [text], "episode_ids": [], "event_ids": []}
+        data["sections"].append(section)
+    else:
+        section = next(section for section in data["sections"] if section["kind"] == kind)
+        section["paragraphs"] = [text]
+    assert validate_script_scope(data, request(), research()) == {1, 2}
+
+
+@pytest.mark.parametrize("text", [
+    "In season 3, Mara escapes.",
+    "Season three reveals who betrayed Mara.",
+    "Season four changes the ending.",
+    "Here is the story before season 4.",
+    "Before season 3, remember that in season 3 Mara escapes.",
+    "Ahead of season three, S03E01 resolves the conflict.",
+    "Before S03E01, Mara escapes.",
+    "Before season three, S04E01 changes everything.",
+])
+def test_cutoff_wording_cannot_hide_future_plot_or_episode_references(text):
+    data = script()
+    data["sections"].append({"id": "outro", "kind": "outro", "season": None,
+                             "paragraphs": [text], "episode_ids": [], "event_ids": []})
+    with pytest.raises(PipelineError, match="incoming or later-season plot"):
+        validate_script_scope(data, request(), research())
+
+
+def test_valid_cutoff_does_not_authorize_incoming_season_sources():
+    data, bundle = script(), research()
+    data["sections"].append({"id": "outro", "kind": "outro", "season": None,
+                             "paragraphs": ["The story so far before season 3."],
+                             "episode_ids": [], "event_ids": []})
+    bundle["sources"].append({"id": "future", "season": 3})
+    data["source_ids"].append("future")
+    with pytest.raises(PipelineError, match="incoming or later-season source"):
+        validate_script_scope(data, request(), bundle)

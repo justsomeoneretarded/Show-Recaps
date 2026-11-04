@@ -111,6 +111,36 @@ def _ids(value, label, *, nonempty=False):
     return set(rows)
 
 
+# Spoken season numbers occur naturally in narration as well as digits.
+_SEASON_WORDS = {word: number for number, word in enumerate(
+    ("one two three four five six seven eight nine ten eleven twelve thirteen "
+     "fourteen fifteen sixteen seventeen eighteen nineteen twenty").split(), 1)}
+_SEASON_NUMBER = re.compile(
+    r"\bseason\s+(\d+|" + "|".join(_SEASON_WORDS) + r")\b", re.I)
+_CUTOFF_PREFIX = re.compile(
+    r"\b(?:before|ahead\s+of)\s+(?:(?:the\s+)?(?:incoming|upcoming)\s+)?$", re.I)
+
+
+def narration_within_scope(text, upcoming):
+    """Allow an incoming-season cutoff, never incoming-season plot references.
+
+    This checks explicit scope, not the truth of prose. The factual edit still
+    checks every narrated claim against its cited evidence.
+    """
+    if any(int(number) >= upcoming
+           for number in re.findall(r"\bS(\d+)E\d+\b", text, re.I)):
+        return False
+    for match in _SEASON_NUMBER.finditer(text):
+        label = match.group(1).lower()
+        number = int(label) if label.isdigit() else _SEASON_WORDS[label]
+        if number >= upcoming:
+            # "Before season N" locates the end of the recap's scope. It does
+            # not grant permission to include another future-season reference.
+            if number != upcoming or not _CUTOFF_PREFIX.search(text[:match.start()]):
+                return False
+    return True
+
+
 def validate_script_scope(script, spec, bundle):
     """Reject crossed identities, future seasons and uncited story before TTS.
 
@@ -195,9 +225,8 @@ def validate_script_scope(script, spec, bundle):
         if any(not isinstance(text, str) or not text.strip() for text in paragraphs):
             raise PipelineError("Every narration paragraph must contain text.")
         for text in paragraphs:
-            numbers = re.findall(r"\bseason\s+(\d+)\b|\bS(\d{1,3})E\d+\b", text, flags=re.I)
-            if any(int(a or b) >= spec.upcoming_season for a, b in numbers):
-                raise PipelineError("Narration explicitly references the incoming or a later season.")
+            if not narration_within_scope(text, spec.upcoming_season):
+                raise PipelineError("Narration explicitly references incoming or later-season plot.")
         delivery = section.get("delivery")
         if delivery is not None and (not isinstance(delivery, list) or len(delivery) != len(paragraphs)
                 or any(label not in ("normal", "calm", "hype", "dramatic") for label in delivery)):
