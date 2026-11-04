@@ -1,0 +1,123 @@
+name: Recap Validation
+on:
+  push:
+    branches: [feature/show-recaps]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: bash scripts/install_system_packages.sh ffmpeg fonts-dejavu-core
+      - run: python -m pip install -e '.[test]'
+      - run: python -m compileall -q recap_pipeline
+      - name: Recap regressions, including actual media assembly
+        run: pytest -q tests/test_recap_*.py
+      - name: Validate workflows
+        run: |
+          curl -fLsS --retry 3 https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz -o "$RUNNER_TEMP/actionlint.tgz"
+          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes=
+  research:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SHOW_TITLE: Severance
+      SHOW_YEAR: "2022"
+      UPCOMING_SEASON: "2"
+      RECAP_BRIEF: A source-coverage validation, not a production video.
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -e '.[test]'
+      - name: Resolve a real show and prior-season plot sources
+        run: python -m recap_pipeline.cli --stage research
+      - name: Check the research boundary and ending source
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          bundle=json.loads(Path("work/shared/research.json").read_text())
+          assert bundle["show"]["title"]=="Severance"
+          assert [s["number"] for s in bundle["seasons"]]==[1]
+          episodes=bundle["seasons"][0]["episodes"]
+          assert episodes and all(e["season"]==1 for e in episodes)
+          finale=max(episodes,key=lambda e:e["number"])
+          print("Finale:",finale["title"],"depth:",finale.get("summary_depth"))
+          print("Coverage:",json.dumps(bundle.get("research_quality",{})))
+          assert finale.get("detailed_plot_available"),"The live finale has no detailed plot source."
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recap-source-validation
+          path: |
+            work/shared/spec.json
+            work/shared/research.json
+          retention-days: 2
+          if-no-files-found: ignore
+  scripts:
+    needs: [checks, research]
+    if: "${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[recap-live]') }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      SCRIPT_MODEL: gemma4:12b
+      OLLAMA_HOST: 127.0.0.1:11435
+      OLLAMA_URL: http://127.0.0.1:11435
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: q8_0
+      OLLAMA_MODELS: ${{ github.workspace }}/work/ollama-models
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m scripts.runner_disk --stage script
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: bash scripts/install_system_packages.sh zstd
+      - run: python -m pip install -e '.[test]'
+      - uses: actions/download-artifact@v4
+        with:
+          name: recap-source-validation
+          path: work/shared
+      - run: bash scripts/bootstrap_ollama.sh
+      - name: Build a real ledger and the two distinct scripts
+        run: python -m recap_pipeline.cli --stage write
+      - name: Check both script scopes
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path("work/shared")
+          for kind in ("season","series"):
+              script=json.loads((root/(kind+"-script.json")).read_text())
+              assert script["kind"]==kind and script["seasons"]==[1]
+              assert any(s["kind"]=="story" for s in script["sections"])
+              assert any(s["kind"]=="ending" for s in script["sections"])
+              print("RECAP_SCRIPT",kind,json.dumps(script,ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recap-script-validation
+          path: |
+            work/shared/story-ledger.json
+            work/shared/season-script.json
+            work/shared/series-script.json
+          retention-days: 2
+          if-no-files-found: ignore

@@ -1,0 +1,260 @@
+name: Generate Show Recaps
+run-name: "Recaps — ${{ inputs.show_title }} before Season ${{ inputs.upcoming_season }}"
+on:
+  workflow_dispatch:
+    inputs:
+      show_title:
+        description: "Show's full title"
+        type: string
+        required: true
+      premiere_year:
+        description: "Year the show first premiered"
+        type: number
+        required: true
+      upcoming_season:
+        description: "Incoming season number; both videos cover earlier seasons only"
+        type: number
+        required: true
+      brief:
+        description: "Optional creative context, tone and visual direction"
+        type: string
+        default: ""
+      narrator:
+        description: "Narrator"
+        type: choice
+        default: Warguy
+        options: [Warguy, Kit Laser, Female]
+      tts_model:
+        description: "Speech model"
+        type: choice
+        default: original
+        options: [original, turbo, nano]
+      season_minutes:
+        description: "Previous-season recap length in minutes (soft ±25%)"
+        type: choice
+        default: Auto
+        options:
+          - 'Auto'
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+          - '6'
+          - '7'
+          - '8'
+          - '9'
+          - '10'
+          - '11'
+          - '12'
+          - '13'
+          - '14'
+          - '15'
+          - '16'
+          - '17'
+          - '18'
+          - '19'
+          - '20'
+          - '21'
+          - '22'
+          - '23'
+          - '24'
+          - '25'
+          - '26'
+          - '27'
+          - '28'
+          - '29'
+          - '30'
+      series_minutes:
+        description: "Whole-series recap length in minutes (soft ±25%)"
+        type: choice
+        default: Auto
+        options:
+          - 'Auto'
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+          - '6'
+          - '7'
+          - '8'
+          - '9'
+          - '10'
+          - '11'
+          - '12'
+          - '13'
+          - '14'
+          - '15'
+          - '16'
+          - '17'
+          - '18'
+          - '19'
+          - '20'
+          - '21'
+          - '22'
+          - '23'
+          - '24'
+          - '25'
+          - '26'
+          - '27'
+          - '28'
+          - '29'
+          - '30'
+      try_4k:
+        description: "Try up to 4K when the available visuals support it"
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: recap-production
+  cancel-in-progress: false
+env:
+  SHOW_TITLE: ${{ inputs.show_title }}
+  SHOW_YEAR: "${{ inputs.premiere_year }}"
+  UPCOMING_SEASON: "${{ inputs.upcoming_season }}"
+  RECAP_BRIEF: ${{ inputs.brief }}
+  NARRATOR: ${{ inputs.narrator }}
+  TTS_MODEL: ${{ inputs.tts_model }}
+  SEASON_MINUTES: ${{ inputs.season_minutes }}
+  SERIES_MINUTES: ${{ inputs.series_minutes }}
+  TRY_4K: "${{ inputs.try_4k }}"
+  SCRIPT_MODEL: gemma4:12b
+  HF_HOME: ${{ github.workspace }}/work/models/huggingface
+  TORCH_HOME: ${{ github.workspace }}/work/models/torch
+  HF_HUB_DISABLE_XET: "1"
+  PYTHONUNBUFFERED: "1"
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      TMDB_READ_TOKEN: ${{ secrets.TMDB_READ_TOKEN }}
+      OLLAMA_HOST: 127.0.0.1:11435
+      OLLAMA_URL: http://127.0.0.1:11435
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: q8_0
+      OLLAMA_MODELS: ${{ github.workspace }}/work/ollama-models
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m scripts.runner_disk --stage produce
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install source and media tools
+        timeout-minutes: 35
+        run: |
+          bash scripts/install_system_packages.sh ffmpeg tesseract-ocr fonts-dejavu-core zstd
+          python -m pip install -e .
+      - name: Configure optional YouTube cookies
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: python -m scripts.prepare_cookies
+      - name: Optional proof-of-origin provider
+        continue-on-error: true
+        run: docker run --name bgutil-provider -d --init -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider
+      - name: Optional downloader fallback route
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/warp_proxy.sh
+      - name: Start the local writing model
+        run: bash scripts/bootstrap_ollama.sh
+      - name: Research once, write both recaps, collect scoped assets
+        run: python -m recap_pipeline.cli --stage prepare
+      - name: Package shared research and assets
+        run: tar -czf recap-shared.tgz work/shared
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recap-shared-${{ github.run_id }}
+          path: recap-shared.tgz
+          retention-days: 1
+      - name: Research and writing diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recap-research-diagnostics
+          path: |
+            work/shared/spec.json
+            work/shared/research.json
+            work/shared/story-ledger.json
+          if-no-files-found: ignore
+          retention-days: 2
+      - name: Remove private cookie file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/youtube-cookies.txt"
+  render:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        kind: [season, series]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      RECAP_KIND: ${{ matrix.kind }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m scripts.runner_disk --stage produce
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install media tools
+        timeout-minutes: 35
+        run: bash scripts/install_system_packages.sh ffmpeg fonts-dejavu-core tesseract-ocr
+      - name: Restore model cache
+        uses: actions/cache@v4
+        with:
+          path: work/models
+          key: recap-models-cpu-v1-${{ runner.os }}-${{ env.TTS_MODEL }}
+      - name: Install the existing CPU voice package
+        run: |
+          python -m pip install torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e '.[voice]'
+      - uses: actions/download-artifact@v4
+        with:
+          name: recap-shared-${{ github.run_id }}
+      - name: Restore shared assets
+        run: tar -xzf recap-shared.tgz && rm recap-shared.tgz
+      - name: Produce the selected recap package
+        run: python -m recap_pipeline.cli --stage render --kind "$RECAP_KIND"
+      - name: Upload completed package
+        uses: actions/upload-artifact@v4
+        with:
+          name: show-recap-${{ matrix.kind }}
+          path: output/${{ matrix.kind }}/
+          retention-days: 2
+      - name: Speech diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recap-speech-diagnostics-${{ matrix.kind }}
+          path: |
+            work/render/${{ matrix.kind }}/speech-checks/*.json
+            work/render/${{ matrix.kind }}/export-audio-review/report.json
+          if-no-files-found: ignore
+          retention-days: 2
+  notify:
+    needs: [prepare, render]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install 'requests>=2.32,<3'
+      - name: Notify only after both packages were uploaded
+        run: python -m recap_pipeline.notify
