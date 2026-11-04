@@ -12,7 +12,7 @@ import requests
 from movie_pipeline.core import PipelineError, key, save_json
 from recap_pipeline.models import narration_within_scope
 
-POLICY_VERSION = 3
+POLICY_VERSION = 4
 MAX_EPISODES_PER_BATCH = 6
 MAX_BATCH_CHARS = 18000
 MAX_EPISODE_CHARS = 12000
