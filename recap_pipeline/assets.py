@@ -6,9 +6,11 @@ metadata. Search rank never supplies evidence. No model chooses footage identity
 from __future__ import annotations
 
 import hashlib
+import heapq
 import io
 import json
 import math
+import os
 import re
 import tempfile
 from datetime import date
@@ -22,15 +24,16 @@ from movie_pipeline import download_access
 from movie_pipeline.core import PipelineError, normalized, probe
 from movie_pipeline.video_settings import require_disk
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 MAX_VIDEOS = 2
 MAX_CANDIDATES = 8
 MAX_DOWNLOAD_ATTEMPTS = 4
 MAX_VIDEO_BYTES = 400_000_000
 MAX_RUN_BYTES = 2_400_000_000
 MAX_IMAGE_BYTES = 12_000_000
-MAX_IMAGE_ATTEMPTS = 6
-MAX_IMAGES = 3
+MAX_IMAGE_FAILURES = 6
+MAX_IMAGE_ATTEMPTS = 48
+MAX_IMAGES = 32
 REJECT = re.compile(
     r"\b(concept|fan.?made|ai.?generated|deepfake|remake|reaction|review|"
     r"recap|explained|analysis|full\s+(?:episode|season|series|movie)|"
@@ -168,10 +171,14 @@ class _Budget:
     def __init__(self):
         self.used = 0
 
+    def can_fit(self, amount: int) -> bool:
+        return self.used + max(0, amount) <= MAX_RUN_BYTES
+
     def add(self, amount: int):
-        self.used += max(0, amount)
-        if self.used > MAX_RUN_BYTES:
+        if not self.can_fit(amount):
+            self.used = MAX_RUN_BYTES
             raise PipelineError("Recap source download byte budget exhausted.")
+        self.used += max(0, amount)
 
 
 def _video_info(path: Path) -> dict:
@@ -295,6 +302,8 @@ def _image_url(value) -> str | None:
 
 
 def _fetch_image(url: str, destination: Path, budget: _Budget) -> dict:
+    if not budget.can_fit(MAX_IMAGE_BYTES):
+        raise PipelineError("Recap source download byte budget exhausted.")
     require_disk(destination.parent)
     data = io.BytesIO()
     with requests.get(url, stream=True, timeout=(10, 25)) as response:
@@ -334,51 +343,142 @@ def _episode_rows(season: dict) -> list[dict]:
     return result
 
 
+def _image_limit() -> int:
+    try:
+        limit = int(os.environ.get("RECAP_MAX_IMAGES_PER_SEASON", str(MAX_IMAGES)))
+    except (TypeError, ValueError) as exc:
+        raise PipelineError("RECAP_MAX_IMAGES_PER_SEASON must be an integer from 1 to 48.") from exc
+    if not 1 <= limit <= MAX_IMAGE_ATTEMPTS:
+        raise PipelineError("RECAP_MAX_IMAGES_PER_SEASON must be an integer from 1 to 48.")
+    return limit
+
+
+def _episode_order(episode: dict) -> tuple:
+    try:
+        number = int(episode.get("number") or 0)
+    except (TypeError, ValueError):
+        number = 0
+    return (number if number > 0 else math.inf,
+            str(episode.get("airdate") or ""), str(episode["id"]))
+
+
+def _image_candidates(season: dict) -> list[dict]:
+    """Finale, premiere, then the middle of the largest uncovered interval."""
+    rows = sorted((episode for episode in _episode_rows(season)
+                   if _image_url(episode.get("image"))), key=_episode_order)
+    if not rows:
+        return []
+    indices = [len(rows) - 1]
+    if len(rows) > 1:
+        indices.append(0)
+    gaps = [(-(len(rows) - 1), 0, len(rows) - 1)]
+    while gaps:
+        _, left, right = heapq.heappop(gaps)
+        if right - left <= 1:
+            continue
+        middle = (left + right) // 2
+        indices.append(middle)
+        heapq.heappush(gaps, (-(middle - left), left, middle))
+        heapq.heappush(gaps, (-(right - middle), middle, right))
+    result, seen = [], set()
+    for index in indices:
+        url = _image_url(rows[index].get("image"))
+        if url not in seen:
+            seen.add(url)
+            result.append(rows[index])
+    return result
+
+
 def _fallback_images(show: dict, season: dict, root: Path, budget: _Budget,
-                     warnings: list[str]) -> list[dict]:
+                     warnings: list[str], cached: list[dict] | None = None,
+                     limit: int | None = None) -> list[dict]:
     number = int(season["number"])
+    limit = _image_limit() if limit is None else limit
+    candidates = _image_candidates(season)
+    cached = cached or []
+    available = {(str(identifier), asset.get("source_url")): asset
+                 for asset in cached if asset.get("scope") == "episode"
+                 for identifier in asset.get("episode_ids") or []}
     records = []
-    seen = set()
-    attempts = 0
-    for episode in _episode_rows(season):
-        if attempts >= MAX_IMAGE_ATTEMPTS or len(records) >= MAX_IMAGES:
+    failures = attempts = reused = 0
+    stopped = set()
+    for episode in candidates:
+        if len(records) >= limit:
+            stopped.add("the per-season image cap")
             break
         url = _image_url(episode.get("image"))
-        if not url or url in seen:
+        saved = available.get((str(episode["id"]), url))
+        if saved is not None:
+            size = Path(saved["path"]).stat().st_size
+            if budget.can_fit(size):
+                budget.add(size)
+                records.append(saved)
+                reused += 1
+            else:
+                stopped.add("the shared source byte budget")
             continue
-        seen.add(url)
+        # Keep scanning cached entries after a provider/budget stop. Previously
+        # verified stills remain useful even when missing URLs are unreachable.
+        if failures >= MAX_IMAGE_FAILURES:
+            stopped.add("the failed-image attempt limit")
+            continue
+        if attempts >= MAX_IMAGE_ATTEMPTS:
+            stopped.add("the total image attempt limit")
+            continue
+        if not budget.can_fit(MAX_IMAGE_BYTES):
+            stopped.add("the shared source byte budget")
+            continue
         attempts += 1
         destination = root / f"episode-{_hash(str(episode['id']), url)}.jpg"
         try:
             metadata = _fetch_image(url, destination, budget)
         except (requests.RequestException, OSError, ValueError, PipelineError, Image.DecompressionBombError):
             destination.unlink(missing_ok=True)
+            failures += 1
             continue
         records.append({"path": str(destination.resolve()), "source_url": url,
                         "title": f"{show['title']} — S{number:02}E{int(episode.get('number') or 0):02}: {episode.get('title') or ''}",
                         "season": number, "kind": "image", **metadata,
                         "episode_ids": [str(episode["id"])], "scope": "episode", "illustrative": False})
     if records:
-        warnings.append(f"Season {number}: no scoped footage was available; using verified prior-episode stills.")
+        order = {str(episode["id"]): _episode_order(episode) for episode in candidates}
+        records.sort(key=lambda asset: min(order[str(identifier)] for identifier in asset["episode_ids"]
+                                          if str(identifier) in order))
+        if reused:
+            warnings.append(f"Season {number}: using cached verified prior-episode stills, enriching the pool where possible.")
+        else:
+            warnings.append(f"Season {number}: no scoped footage was available; using verified prior-episode stills.")
+        if len(records) < len(candidates):
+            reasons = ", ".join(sorted(stopped)) or "unreachable image URLs"
+            warnings.append(f"Season {number}: verified still coverage is {len(records)} of {len(candidates)} available episode images; limited by {reasons}.")
         return records
     # A current generic poster may depict the incoming season. It is safe only
     # with explicit prior-season provenance in the research metadata.
     poster = show.get("image")
     provenance = poster.get("season") if isinstance(poster, dict) else show.get("image_season")
     if str(provenance) == str(number) and (url := _image_url(poster)):
-        destination = root / f"poster-{_hash(url)}.jpg"
-        try:
-            metadata = _fetch_image(url, destination, budget)
-            records.append({"path": str(destination.resolve()), "source_url": url,
-                            "title": f"{show['title']} — season {number} promotional image",
-                            "season": number, "kind": "image", **metadata, "episode_ids": [],
-                            "scope": "season-poster", "illustrative": True})
-            warnings.append(f"Season {number}: a verified season promotional image is illustrative and does not establish any exact event.")
-            return records
-        except (requests.RequestException, OSError, ValueError, PipelineError, Image.DecompressionBombError):
-            destination.unlink(missing_ok=True)
+        saved = next((asset for asset in cached if asset.get("scope") == "season-poster"), None)
+        if saved is not None and budget.can_fit(Path(saved["path"]).stat().st_size):
+            budget.add(Path(saved["path"]).stat().st_size)
+            warnings.append(f"Season {number}: using a cached illustrative season promotional image, not exact event evidence.")
+            return [saved]
+        if (failures < MAX_IMAGE_FAILURES and attempts < MAX_IMAGE_ATTEMPTS
+                and budget.can_fit(MAX_IMAGE_BYTES)):
+            destination = root / f"poster-{_hash(url)}.jpg"
+            try:
+                metadata = _fetch_image(url, destination, budget)
+                records.append({"path": str(destination.resolve()), "source_url": url,
+                                "title": f"{show['title']} — season {number} promotional image",
+                                "season": number, "kind": "image", **metadata, "episode_ids": [],
+                                "scope": "season-poster", "illustrative": True})
+                warnings.append(f"Season {number}: a verified season promotional image is illustrative and does not establish any exact event.")
+                return records
+            except (requests.RequestException, OSError, ValueError, PipelineError, Image.DecompressionBombError):
+                destination.unlink(missing_ok=True)
     destination = root / "neutral-title-card.jpg"
     _neutral_card(show["title"], number, destination)
+    if stopped:
+        warnings.append(f"Season {number}: image collection stopped at {', '.join(sorted(stopped))}.")
     warnings.append(f"Season {number}: no verified season imagery was reachable. Using a neutral illustrative title plate with no actors or plot imagery; the generic current show poster was excluded.")
     return [{"path": str(destination.resolve()), "source_url": "",
              "title": f"{show['title']} — season {number} neutral title plate",
@@ -387,6 +487,7 @@ def _fallback_images(show: dict, season: dict, root: Path, budget: _Budget,
 
 
 def _neutral_card(title: str, season: int, destination: Path):
+    require_disk(destination.parent)
     image = Image.new("RGB", (1280, 720), "#111923")
     draw = ImageDraw.Draw(image)
     draw.rectangle((10, 10, 1269, 709), outline="#72b7b4", width=3)
@@ -418,7 +519,8 @@ def _fingerprint(show: dict, season: dict) -> str:
 def _cached(manifest: Path, show: dict, season: dict, incoming: int) -> list[dict] | None:
     try:
         record = json.loads(manifest.read_text(encoding="utf-8"))
-        if record.get("version") != CACHE_VERSION or record.get("fingerprint") != _fingerprint(show, season):
+        # Legacy sparse pools must pass the same identity/provenance checks before enrichment.
+        if record.get("version") not in {1, CACHE_VERSION} or record.get("fingerprint") != _fingerprint(show, season):
             return None
         assets = record["assets"]
         if not isinstance(assets, list) or not assets:
@@ -475,6 +577,7 @@ def collect_assets(bundle: dict, spec, cache_dir: Path) -> dict:
     root.mkdir(parents=True, exist_ok=True)
     result = {"seasons": {}, "sources": [], "warnings": []}
     budget = _Budget()
+    image_limit = _image_limit()
     for season in sorted(bundle.get("seasons") or [], key=lambda row: int(row["number"])):
         number = int(season["number"])
         if not 0 < number < incoming:
@@ -482,24 +585,34 @@ def collect_assets(bundle: dict, spec, cache_dir: Path) -> dict:
         season_root = root / f"season-{number:02}"
         season_root.mkdir(parents=True, exist_ok=True)
         manifest = season_root / "assets.json"
-        assets = _cached(manifest, show, season, incoming)
-        if assets is None:
+        cached = _cached(manifest, show, season, incoming)
+        if cached is None:
             assets = _discover_videos(show, season, incoming, season_root,
                                       2160 if spec.try_4k else 1080, budget, result["warnings"])
             if not assets:
-                assets = _fallback_images(show, season, season_root, budget, result["warnings"])
-            payload = {"version": CACHE_VERSION, "fingerprint": _fingerprint(show, season), "assets": assets}
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", dir=season_root, delete=False) as temporary:
-                json.dump(payload, temporary, ensure_ascii=False, indent=2)
-                temp_path = Path(temporary.name)
-            temp_path.replace(manifest)
+                assets = _fallback_images(show, season, season_root, budget, result["warnings"],
+                                          limit=image_limit)
+        elif all(asset.get("kind") == "video" for asset in cached):
+            assets = []
+            for asset in cached:
+                size = Path(asset["path"]).stat().st_size
+                if budget.can_fit(size):
+                    budget.add(size)
+                    assets.append(asset)
+                else:
+                    result["warnings"].append(f"Season {number}: cached footage exceeds the shared source byte budget.")
+            if not assets:
+                assets = _fallback_images(show, season, season_root, budget, result["warnings"],
+                                          limit=image_limit)
         else:
-            for scope, message in (
-                ("episode", "using cached verified prior-episode stills."),
-                ("season-poster", "using a cached illustrative season promotional image, not exact event evidence."),
-                ("neutral-title-card", "using a cached neutral illustrative title plate; verified season imagery was unavailable.")):
-                if any(asset.get("scope") == scope for asset in assets):
-                    result["warnings"].append(f"Season {number}: {message}")
+            assets = _fallback_images(show, season, season_root, budget, result["warnings"],
+                                      cached=cached, limit=image_limit)
+        payload = {"version": CACHE_VERSION, "image_limit": image_limit,
+                   "fingerprint": _fingerprint(show, season), "assets": assets}
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", dir=season_root, delete=False) as temporary:
+            json.dump(payload, temporary, ensure_ascii=False, indent=2)
+            temp_path = Path(temporary.name)
+        temp_path.replace(manifest)
         result["seasons"][str(number)] = assets
         result["sources"].extend({"url": asset["source_url"], "title": asset["title"], "season": number}
                                  for asset in assets if asset.get("source_url"))

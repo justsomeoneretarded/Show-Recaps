@@ -233,6 +233,8 @@ def test_real_ffmpeg_complete_recap_packages_both_scopes(tmp_path, monkeypatch, 
                for section in script["sections"] for text in section["paragraphs"])
     assert "Mara" in srt and "-->" in srt
     description = (output / "description.txt").read_text()
+    assert all(p in description for p in [p for s in script["sections"] for p in s["paragraphs"]][:2])
+    assert "#FixtureShow" in description and "#PreviouslyOn" in description
     for chapter in report["youtube_chapters"]:
         assert f"{rendering._youtube_time(chapter['start'])} {chapter['title']}" in description
     assert "visual-3" not in (output / "source-credits.txt").read_text()

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import re
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
@@ -406,8 +407,13 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
             credits = _credits(bundle, scoped_assets, script, theme)
             yt_chapters = _description_chapters(actual_chapters, total)
             chapter_text = "\n".join(f"{_youtube_time(chapter['start'])} {chapter['title']}" for chapter in yt_chapters)
-            description = str(script.get("description") or "") + "\n\nChapters\n" + chapter_text
+            opening = [p for section in script["sections"] for p in section["paragraphs"]][:2]
+            description = str(script.get("description") or "") + "\n\n" + "\n\n".join(opening)
+            description += "\n\nChapters\n" + chapter_text
             description += "\n\nResearch and visual sources\n" + credits
+            show_tag = re.sub(r"[^A-Za-z0-9]", "", str(script.get("show_title") or ""))[:70] or "TVRecap"
+            scope_tag = f"Season{int(_value(spec,'upcoming_season'))-1}Recap" if script["kind"]=="season" else "SeriesRecap"
+            description += f"\n\n#{show_tag} #{scope_tag} #PreviouslyOn"
             report["warnings"].extend(usage.warnings)
             report.update(status="passed", duration=total, final_speed=speed, chapters=actual_chapters,
                           youtube_chapters=yt_chapters, youtube_chapters_eligible=len(yt_chapters)>=3,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -395,3 +396,222 @@ def test_season_release_year_is_not_mistaken_for_a_conflicting_premiere(bundle):
     identified = {**candidate, "description": "North Star (2020), season 2."}
     assert assets.candidate_ok(identified, {**show, "ambiguous_title": True}, 2, 3, 2021)
     assert assets._identity_evidence(identified, show) == "premiere-year"
+
+
+def _episodes(count, season=1):
+    return [{"id": f"s{season}ep{number}", "season": season, "number": number,
+             "title": f"Episode {number}",
+             "airdate": (date(2020, 1, 1) + timedelta(days=number - 1)).isoformat(),
+             "image": {"original": f"https://images.example/s{season}ep{number}.jpg"}}
+            for number in range(1, count + 1)]
+
+
+def test_nine_episode_pool_includes_finale_and_late_episodes(monkeypatch, tmp_path, bundle, spec):
+    no_video(monkeypatch)
+    monkeypatch.delenv("RECAP_MAX_IMAGES_PER_SEASON", raising=False)
+    episodes = _episodes(9)
+    bundle["seasons"][0]["episodes"] = episodes[4:] + episodes[:4]
+    calls, body = [], _jpeg()
+
+    def get(url, **kwargs):
+        calls.append(url)
+        return Response(body)
+    monkeypatch.setattr(assets.requests, "get", get)
+    result = assets.collect_assets(bundle, spec, tmp_path)
+    records = result["seasons"]["1"]
+    assert [record["episode_ids"] for record in records] == [[f"s1ep{n}"] for n in range(1, 10)]
+    assert calls[:3] == [episodes[n]["image"]["original"] for n in (8, 0, 4)]
+    assert len(calls) == 9
+    assert {record["source_url"] for record in records} == set(calls)
+    assert all(not record["illustrative"] for record in records)
+
+
+def test_large_season_cap_distributes_images_and_reports_partial_coverage(monkeypatch, tmp_path, bundle, spec):
+    no_video(monkeypatch)
+    monkeypatch.setenv("RECAP_MAX_IMAGES_PER_SEASON", "5")
+    bundle["seasons"][0]["episodes"] = _episodes(120)
+    calls, body = [], _jpeg()
+    monkeypatch.setattr(assets.requests, "get",
+                        lambda url, **kwargs: (calls.append(url), Response(body))[1])
+    result = assets.collect_assets(bundle, spec, tmp_path)
+    ids = {record["episode_ids"][0] for record in result["seasons"]["1"]}
+    assert ids == {"s1ep1", "s1ep30", "s1ep60", "s1ep90", "s1ep120"}
+    assert len(calls) == 5
+    assert any("5 of 120" in warning and "per-season image cap" in warning
+               for warning in result["warnings"])
+
+
+def test_default_cap_is_large_but_bounded(monkeypatch, tmp_path, bundle, spec):
+    no_video(monkeypatch)
+    monkeypatch.delenv("RECAP_MAX_IMAGES_PER_SEASON", raising=False)
+    bundle["seasons"][0]["episodes"] = _episodes(100)
+    body = _jpeg()
+    monkeypatch.setattr(assets.requests, "get", lambda *args, **kwargs: Response(body))
+    result = assets.collect_assets(bundle, spec, tmp_path)
+    records = result["seasons"]["1"]
+    assert len(records) == assets.MAX_IMAGES == 32
+    assert records[0]["episode_ids"] == ["s1ep1"]
+    assert records[-1]["episode_ids"] == ["s1ep100"]
+
+
+def test_successes_do_not_consume_failed_image_quota(monkeypatch, tmp_path, bundle, spec):
+    no_video(monkeypatch)
+    monkeypatch.delenv("RECAP_MAX_IMAGES_PER_SEASON", raising=False)
+    bundle["seasons"][0]["episodes"] = _episodes(20)
+    calls, body = [], _jpeg()
+
+    def get(url, **kwargs):
+        calls.append(url)
+        if len(calls) % 2 == 0:
+            raise assets.requests.ConnectionError("provider unavailable")
+        return Response(body)
+    monkeypatch.setattr(assets.requests, "get", get)
+    result = assets.collect_assets(bundle, spec, tmp_path)
+    assert len(calls) == 2 * assets.MAX_IMAGE_FAILURES == 12
+    assert len(result["seasons"]["1"]) == 6
+    assert any("failed-image attempt limit" in warning for warning in result["warnings"])
+
+
+def test_unreachable_provider_stops_after_six_failures_including_poster(monkeypatch, tmp_path, bundle, spec):
+    no_video(monkeypatch)
+    monkeypatch.delenv("RECAP_MAX_IMAGES_PER_SEASON", raising=False)
+    bundle["seasons"][0]["episodes"] = _episodes(100)
+    bundle["show"]["image"]["season"] = 1
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(url)
+        raise assets.requests.ConnectionError("provider unavailable")
+    monkeypatch.setattr(assets.requests, "get", get)
+    result = assets.collect_assets(bundle, spec, tmp_path)
+    assert len(calls) == assets.MAX_IMAGE_FAILURES == 6
+    assert all("current-poster" not in url for url in calls)
+    assert result["seasons"]["1"][0]["scope"] == "neutral-title-card"
+
+
+def test_total_image_attempt_limit_is_independent_of_failures(monkeypatch, tmp_path, bundle, spec):
+    no_video(monkeypatch)
+    monkeypatch.setenv("RECAP_MAX_IMAGES_PER_SEASON", "48")
+    bundle["seasons"][0]["episodes"] = _episodes(100)
+    calls, body = [], _jpeg()
+
+    def get(url, **kwargs):
+        calls.append(url)
+        if len(calls) <= 5:
+            raise assets.requests.ConnectionError("temporary image failure")
+        return Response(body)
+    monkeypatch.setattr(assets.requests, "get", get)
+    result = assets.collect_assets(bundle, spec, tmp_path)
+    assert len(calls) == assets.MAX_IMAGE_ATTEMPTS == 48
+    assert len(result["seasons"]["1"]) == 43
+    assert any("total image attempt limit" in warning for warning in result["warnings"])
+
+
+def test_legacy_three_image_cache_is_validated_reused_and_enriched(monkeypatch, tmp_path, bundle, spec):
+    searches = no_video(monkeypatch)
+    episodes = _episodes(9)
+    bundle["seasons"][0]["episodes"] = episodes
+    monkeypatch.setenv("RECAP_MAX_IMAGES_PER_SEASON", "3")
+    calls, body = [], _jpeg()
+    monkeypatch.setattr(assets.requests, "get",
+                        lambda url, **kwargs: (calls.append(url), Response(body))[1])
+    assets.collect_assets(bundle, spec, tmp_path)
+    manifest = next(tmp_path.rglob("assets.json"))
+    record = json.loads(manifest.read_text())
+    record["version"] = 1
+    record.pop("image_limit", None)
+    manifest.write_text(json.dumps(record))
+    cached_urls = {asset["source_url"] for asset in record["assets"]}
+    calls.clear()
+    monkeypatch.delenv("RECAP_MAX_IMAGES_PER_SEASON", raising=False)
+    result = assets.collect_assets(bundle, spec, tmp_path)
+    assert searches == [1]
+    assert len(result["seasons"]["1"]) == 9
+    assert len(calls) == 6 and not cached_urls.intersection(calls)
+    upgraded = json.loads(manifest.read_text())
+    assert upgraded["version"] == assets.CACHE_VERSION == 2
+    assert upgraded["image_limit"] == 32
+    assert len(upgraded["assets"]) == 9
+
+
+def test_safe_sparse_cache_survives_provider_failure_during_enrichment(monkeypatch, tmp_path, bundle, spec):
+    searches = no_video(monkeypatch)
+    bundle["seasons"][0]["episodes"] = _episodes(20)
+    monkeypatch.setenv("RECAP_MAX_IMAGES_PER_SEASON", "3")
+    body = _jpeg()
+    monkeypatch.setattr(assets.requests, "get", lambda *args, **kwargs: Response(body))
+    before = assets.collect_assets(bundle, spec, tmp_path)["seasons"]["1"]
+    monkeypatch.delenv("RECAP_MAX_IMAGES_PER_SEASON", raising=False)
+    calls = []
+
+    def failed(url, **kwargs):
+        calls.append(url)
+        raise assets.requests.ConnectionError("provider unavailable")
+    monkeypatch.setattr(assets.requests, "get", failed)
+    after = assets.collect_assets(bundle, spec, tmp_path)["seasons"]["1"]
+    assert searches == [1]
+    assert len(calls) == 6
+    assert {asset["source_url"] for asset in after} == {asset["source_url"] for asset in before}
+
+
+def test_poisoned_legacy_cache_cannot_be_enriched_as_valid(monkeypatch, tmp_path, bundle, spec):
+    searches = no_video(monkeypatch)
+    body = _jpeg()
+    monkeypatch.setattr(assets.requests, "get", lambda *args, **kwargs: Response(body))
+    assets.collect_assets(bundle, spec, tmp_path)
+    manifest = next(tmp_path.rglob("assets.json"))
+    record = json.loads(manifest.read_text())
+    record["version"] = 1
+    record["assets"][0]["source_url"] = "https://images.example/incoming.jpg"
+    manifest.write_text(json.dumps(record))
+    result = assets.collect_assets(bundle, spec, tmp_path)
+    assert searches == [1, 1]
+    assert result["seasons"]["1"][0]["source_url"] == "https://images.example/ep1.jpg"
+
+
+def test_shared_source_budget_stops_requests_across_seasons(monkeypatch, tmp_path, bundle, spec):
+    no_video(monkeypatch)
+    monkeypatch.delenv("RECAP_MAX_IMAGES_PER_SEASON", raising=False)
+    bundle["seasons"][0]["episodes"] = _episodes(2, season=1)
+    bundle["seasons"][1]["episodes"] = _episodes(2, season=2)
+    spec.upcoming_season = 3
+    body, calls, checks = _jpeg(), [], []
+    monkeypatch.setattr(assets, "MAX_IMAGE_BYTES", len(body))
+    monkeypatch.setattr(assets, "MAX_RUN_BYTES", len(body) * 3)
+    monkeypatch.setattr(assets, "require_disk", lambda path: checks.append(path))
+    monkeypatch.setattr(assets.requests, "get",
+                        lambda url, **kwargs: (calls.append(url), Response(body))[1])
+    result = assets.collect_assets(bundle, spec, tmp_path)
+    assert len(calls) == 3
+    assert len(result["seasons"]["1"]) == 2
+    assert result["seasons"]["2"][0]["episode_ids"] == ["s2ep2"]
+    assert len(checks) == 3
+    assert any("shared source byte budget" in warning for warning in result["warnings"])
+
+
+def test_cached_sources_share_budget_with_new_seasons(monkeypatch, tmp_path, bundle, spec):
+    no_video(monkeypatch)
+    monkeypatch.delenv("RECAP_MAX_IMAGES_PER_SEASON", raising=False)
+    body, calls = _jpeg(), []
+    monkeypatch.setattr(assets.requests, "get",
+                        lambda url, **kwargs: (calls.append(url), Response(body))[1])
+    first = assets.collect_assets(bundle, spec, tmp_path)
+    saved_size = Path(first["seasons"]["1"][0]["path"]).stat().st_size
+    monkeypatch.setattr(assets, "MAX_IMAGE_BYTES", len(body))
+    monkeypatch.setattr(assets, "MAX_RUN_BYTES", saved_size + len(body))
+    spec.upcoming_season = 3
+    bundle["seasons"][1]["episodes"] = _episodes(2, season=2)
+    calls.clear()
+    result = assets.collect_assets(bundle, spec, tmp_path)
+    assert calls == ["https://images.example/s2ep2.jpg"]
+    assert result["seasons"]["1"][0]["path"] == first["seasons"]["1"][0]["path"]
+    assert len(result["seasons"]["2"]) == 1
+    assert any("shared source byte budget" in warning for warning in result["warnings"])
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "49", "many"])
+def test_image_cap_configuration_is_validated_before_download(monkeypatch, tmp_path, bundle, spec, value):
+    monkeypatch.setenv("RECAP_MAX_IMAGES_PER_SEASON", value)
+    monkeypatch.setattr(assets, "_discover_videos", lambda *args: pytest.fail("Invalid cap searched providers."))
+    with pytest.raises(PipelineError, match="RECAP_MAX_IMAGES_PER_SEASON"):
+        assets.collect_assets(bundle, spec, tmp_path)
