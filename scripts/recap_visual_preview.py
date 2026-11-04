@@ -6,13 +6,17 @@ from pathlib import Path
 from PIL import Image
 from recap_pipeline.cli import load_spec, _asset_paths
 from recap_pipeline.thumbnails import build_thumbnails
+from recap_pipeline.assets import collect_assets
+from movie_pipeline.core import save_json
 
 
 def main():
     root=Path("work/shared")
     spec=load_spec(root)
     bundle=json.loads((root/"research.json").read_text())
-    registry=_asset_paths(json.loads((root/'assets.json').read_text()),root,portable=False)
+    raw=collect_assets(bundle,spec,(root/"asset-cache").resolve())
+    save_json(root/"assets.json",_asset_paths(raw,root,portable=True))
+    registry=_asset_paths(json.loads((root/"assets.json").read_text()),root,portable=False)
     season=spec.upcoming_season-1
     script={"kind":"season","show_title":bundle["show"]["title"],"upcoming_season":spec.upcoming_season,
             "seasons":[season],"title":f"{bundle['show']['title']}: Season {season} Recap",

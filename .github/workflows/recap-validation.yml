@@ -63,8 +63,6 @@ jobs:
           node-version: "22"
       - name: Install tools for real asset discovery
         run: bash scripts/install_system_packages.sh ffmpeg fonts-dejavu-core
-      - name: Discover real scoped assets with graceful still fallback
-        run: python -m recap_pipeline.cli --stage assets
       - name: Preview the actual thumbnail path
         run: python -m scripts.recap_visual_preview
       - uses: actions/upload-artifact@v4

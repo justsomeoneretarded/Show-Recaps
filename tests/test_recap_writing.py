@@ -221,8 +221,8 @@ def test_general_edit_repairs_pitch_and_rejects_unsupported_statement(tmp_path):
     assert_valid_citations(script, bundle, ledger, {1})
 
 
-@pytest.mark.parametrize("unsafe", ["Stream on Netflix for season 2.", "Disney+ has the story.",
-                                   "Paramount+ has the story.", "Apple TV+ has the story."])
+@pytest.mark.parametrize("unsafe", ["Stream on Netflix now.", "Watch it on Disney+.",
+                                   "Available to stream on Paramount+.", "Watch now on Apple TV+."])
 def test_unsafe_editor_output_cannot_be_certified_by_supported_flag(tmp_path, unsafe):
     bundle, model = bundle_with_seasons(1, 1), Model()
     ledger = build_ledger(bundle, tmp_path / "ledger", writer=model)
@@ -461,3 +461,23 @@ def test_truncated_finale_cannot_certify_an_ending_from_an_incomplete_prompt(tmp
     assert ledger["events"] and not any(event["ending_state"] for event in ledger["events"])
     with pytest.raises(PipelineError, match="No verified final-episode ending state"):
         write_recap("season", spec(2), bundle, ledger, tmp_path / "script", writer=model)
+
+
+
+@pytest.mark.parametrize("fact", [
+    "The bomb's countdown reaches zero after Mara cuts the wrong wire.",
+    "Mara loses her military rank after refusing the order.",
+    "Number One opens the gate and lets Ivo escape.",
+    "Netflix buys the studio, while Hulu withdraws its offer.",
+])
+def test_story_vocabulary_is_retained_when_its_narrative_role_is_sourced_plot(tmp_path, fact):
+    bundle, model = bundle_with_seasons(1, 1), Model()
+    episode = bundle["seasons"][0]["episodes"][0]
+    episode["summary"] = fact + " At the end, Ivo is free while Mara remains inside."
+    episode["source_texts"][episode["sources"][0]] = episode["summary"]
+    ledger = build_ledger(bundle, tmp_path / "ledger", writer=model)
+    script = write_recap("season", spec(2), bundle, ledger, tmp_path / "script", writer=model)
+    assert fact in spoken(script)
+    assert_valid_citations(script, bundle, ledger, {1})
+    prompts = [task for task, _, _ in model.calls if "EDIT_AND_VERIFY_RECAP" in task]
+    assert prompts and all("actual story facts" in task for task in prompts)
