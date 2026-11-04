@@ -91,8 +91,11 @@ def write_stage(shared):
         scripts = {}
         for kind in KINDS:
             script = write_recap(kind, spec, bundle, ledger, cache, writer)
+            draft = shared / f"{kind}-draft.json"
+            save_json(draft, script)
             validate_script_scope(script, spec, bundle)
             save_json(shared / f"{kind}-script.json", script)
+            draft.unlink(missing_ok=True)
             scripts[kind] = script
         return scripts
     finally:

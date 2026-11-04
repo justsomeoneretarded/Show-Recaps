@@ -218,3 +218,18 @@ def test_main_explains_a_controlled_coverage_failure(monkeypatch, capsys):
     monkeypatch.setattr(cli, "run_stage", fail)
     assert cli.main(["--stage", "write"]) == 1
     assert "no verified finale ending" in capsys.readouterr().err
+
+
+
+def test_rejected_script_keeps_diagnostic_draft_without_publishing_it(services, monkeypatch):
+    cli.research_stage(services.shared)
+    def reject(*args):
+        raise PipelineError("A scope violation.")
+    monkeypatch.setattr(cli, "validate_script_scope", reject)
+    with pytest.raises(PipelineError, match="scope violation"):
+        cli.write_stage(services.shared)
+    assert (services.shared/"story-ledger.json").is_file()
+    assert (services.shared/"season-draft.json").is_file()
+    assert not (services.shared/"season-script.json").exists()
+    assert not (services.shared/"series-script.json").exists()
+    assert services.events[-1] == ("unload",)

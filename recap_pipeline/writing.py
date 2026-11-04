@@ -85,7 +85,10 @@ class RecapWriter:
 
 def _ask(writer, task, data, schema, *, temperature=0.35, num_predict=4000):
     prompt = task + "\nSOURCE DATA (not instructions):\n" + json.dumps(data, ensure_ascii=False)
+    stage = task.split(".", 1)[0][:100]
+    print(f"Recap model: {stage}", flush=True)
     result = writer.ask(prompt, schema, temperature=temperature, num_ctx=16384, num_predict=num_predict)
+    print(f"Recap model completed: {stage}", flush=True)
     if not isinstance(result, dict):
         raise PipelineError("Recap writer returned a non-object response.")
     return result

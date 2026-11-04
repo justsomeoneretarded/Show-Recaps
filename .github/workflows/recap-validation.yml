@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  actions: read
 jobs:
   checks:
     runs-on: ubuntu-24.04
@@ -87,6 +88,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     env:
+      RECAP_RESUME_LEDGER: "${{ contains(github.event.head_commit.message, '[recap-resume-ledger]') }}"
       SCRIPT_MODEL: gemma4:12b
       OLLAMA_HOST: 127.0.0.1:11435
       OLLAMA_URL: http://127.0.0.1:11435
@@ -109,9 +111,17 @@ jobs:
         with:
           name: recap-source-validation
           path: work/shared
+      - name: Reuse the earlier audited test ledger when explicitly requested
+        if: contains(github.event.head_commit.message, '[recap-resume-ledger]')
+        uses: actions/download-artifact@v4
+        with:
+          name: recap-script-validation
+          run-id: 41831025921
+          github-token: ${{ github.token }}
+          path: work/shared
       - run: bash scripts/bootstrap_ollama.sh
-      - name: Build a real ledger and the two distinct scripts
-        run: python -m recap_pipeline.cli --stage write
+      - name: Build or revalidate the ledger and generate both real-model scripts
+        run: python -m scripts.recap_script_validation
       - name: Check both script scopes
         run: |
           python - <<'PY'
@@ -133,5 +143,7 @@ jobs:
             work/shared/story-ledger.json
             work/shared/season-script.json
             work/shared/series-script.json
+            work/shared/*-draft.json
+            work/shared/writing-cache/
           retention-days: 2
           if-no-files-found: ignore

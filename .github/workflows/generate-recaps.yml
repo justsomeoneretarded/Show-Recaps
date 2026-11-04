@@ -128,7 +128,7 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 350
     env:
       TMDB_READ_TOKEN: ${{ secrets.TMDB_READ_TOKEN }}
       OLLAMA_HOST: 127.0.0.1:11435
@@ -185,6 +185,9 @@ jobs:
             work/shared/spec.json
             work/shared/research.json
             work/shared/story-ledger.json
+            work/shared/*-draft.json
+            work/shared/*-script.json
+            work/shared/writing-cache/
           if-no-files-found: ignore
           retention-days: 2
       - name: Remove private cookie file
