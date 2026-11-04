@@ -158,3 +158,29 @@ def test_uncited_intro_and_outro_are_allowed_but_cannot_carry_story_evidence():
     intro["episode_ids"] = ["e1"]
     with pytest.raises(PipelineError):
         validate_script_scope(data, request(), research())
+
+
+
+@pytest.mark.parametrize("unused_current_metadata", [False, True])
+def test_relabelled_earlier_story_does_not_cover_a_later_season(unused_current_metadata):
+    data = script()
+    earlier = deepcopy(data["sections"][0])
+    earlier.update(id="story-2", season=2, title="Season 2")
+    if unused_current_metadata:
+        earlier["episode_ids"].append("e2")
+        earlier["event_ids"].append("v2")
+    data["sections"][1] = earlier
+    # Keep the genuine latest-season ending; it cannot replace missing body story.
+    with pytest.raises(PipelineError, match="every covered season"):
+        validate_script_scope(data, request(), research())
+
+
+def test_prior_context_and_current_story_together_cover_the_later_season():
+    data = script()
+    data["sections"][1].update(
+        paragraphs=["An earlier choice still matters.", "A current-season consequence follows."],
+        episode_ids=["e1", "e2"], event_ids=["v1", "v2"],
+        paragraph_episode_ids=[["e1"], ["e2"]], paragraph_event_ids=[["v1"], ["v2"]],
+        delivery=["normal", "normal"],
+    )
+    assert validate_script_scope(data, request(), research()) == {1, 2}

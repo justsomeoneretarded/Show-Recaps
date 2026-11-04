@@ -481,3 +481,21 @@ def test_story_vocabulary_is_retained_when_its_narrative_role_is_sourced_plot(tm
     assert_valid_citations(script, bundle, ledger, {1})
     prompts = [task for task, _, _ in model.calls if "EDIT_AND_VERIFY_RECAP" in task]
     assert prompts and all("actual story facts" in task for task in prompts)
+
+
+
+def test_earlier_context_alone_cannot_satisfy_a_later_season_story(tmp_path):
+    bundle, model = bundle_with_seasons(2, 1), Model()
+    ledger = build_ledger(bundle, tmp_path / "ledger", writer=model)
+    def draft(data):
+        if data["purpose"] == "story" and data["season"] == 2:
+            earlier = next(event for event in data["events"] if event["season"] == 1)
+            return {"title": "An earlier choice", "paragraphs": [
+                {"text": earlier["summary"], "event_ids": [earlier["id"]], "delivery": "normal"}]}
+        return {"title": "The story", "paragraphs": [
+            {"text": event["summary"], "event_ids": [event["id"]], "delivery": "normal"}
+            for event in data["events"] if event["id"] in data["focus_event_ids"]]}
+    model.draft = draft
+    assert any(event["season"] == 2 and event["ending_state"] for event in ledger["events"])
+    with pytest.raises(PipelineError, match=r"required season\(s\): 2"):
+        write_recap("series", spec(3), bundle, ledger, tmp_path / "script", writer=model)

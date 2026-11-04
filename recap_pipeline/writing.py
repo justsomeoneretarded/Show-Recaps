@@ -492,7 +492,11 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None):
             if result.get("omitted"):
                 warnings.append(f"Some season {season} narration was omitted because it lacked factual or editorial support.")
     # The latest episode must actually have supported evidence before claiming where we left off.
-    represented_seasons = {section["season"] for section in sections if section["kind"] == "story"}
+    represented_seasons = {
+        section["season"] for section in sections if section["kind"] == "story"
+        and any(event_map[event_id]["season"] == section["season"]
+                for event_id in section["event_ids"])
+    }
     missing_story = [number for number in seasons if number not in represented_seasons]
     if missing_story:
         raise PipelineError("No verified story narration survived for required season(s): "

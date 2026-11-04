@@ -231,7 +231,12 @@ def validate_script_scope(script, spec, bundle):
                     if not _ids(group, field, nonempty=True).issubset(parent_ids):
                         raise PipelineError("Paragraph evidence is outside the section's supported scope.")
         if kind == "story":
-            story_seasons.add(number)
+            # Earlier-season context is valid, but cannot substitute for this
+            # season's own story. Count actual paragraph citations when present.
+            story_episode_ids = (set().union(*map(set, section["paragraph_episode_ids"]))
+                                 if "paragraph_episode_ids" in section else episode_ids)
+            if any(episodes[identity]["season"] == number for identity in story_episode_ids):
+                story_seasons.add(number)
         else:
             if number != spec.upcoming_season - 1:
                 raise PipelineError("The ending must describe the latest prior season.")
