@@ -1,4 +1,4 @@
-"""Best-effort completion reminder, called only after both uploads succeed."""
+"""Best-effort completion reminder, called only after every upload succeeds."""
 from __future__ import annotations
 
 from html import escape
@@ -34,12 +34,15 @@ def notify(*, env=None, session=None):
     incoming = env.get("UPCOMING_SEASON", "").strip()
     season = str(int(incoming) - 1) if re.fullmatch(r"(?:[2-9]|[1-9][0-9]|100)", incoming) else "previous"
     gap = "\n" * 6
-    message = gap.join([
-        "✅ <b>Both show recaps are ready!</b>",
-        f"<b>Show:</b> {escape(title)}",
-        f"<b>Two packages:</b> Season {season} Recap and The Story So Far",
-        f'<b>Download:</b> <a href="{escape(run_url, quote=True)}">GitHub run link</a>',
-    ]) + "\n\nOpen Artifacts to download both packages. Available for 48 hours."
+    if season == "1":
+        lines = ["✅ <b>Your show recap is ready!</b>", f"<b>Show:</b> {escape(title)}",
+                 "<b>One package:</b> Season 1 Recap"]
+        closing = "\n\nOpen Artifacts to download the package. Available for 48 hours."
+    else:
+        lines = ["✅ <b>Both show recaps are ready!</b>", f"<b>Show:</b> {escape(title)}",
+                 f"<b>Two packages:</b> Season {season} Recap and The Story So Far"]
+        closing = "\n\nOpen Artifacts to download both packages. Available for 48 hours."
+    message = gap.join([*lines, f'<b>Download:</b> <a href="{escape(run_url, quote=True)}">GitHub run link</a>']) + closing
     try:
         response = session.post(f"https://api.telegram.org/bot{token}/sendMessage", json={
             "chat_id": chat_id, "text": message, "parse_mode": "HTML",

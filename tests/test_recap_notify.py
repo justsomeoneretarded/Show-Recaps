@@ -103,3 +103,11 @@ def test_malformed_season_input_cannot_inject_message_or_raise(incoming):
     transport = Transport()
     assert notify(env=_env(UPCOMING_SEASON=incoming, TELEGRAM_PIN="false"), session=transport)
     assert "Season previous Recap" in transport.calls[0][1]["json"]["text"]
+
+
+def test_season_one_only_run_announces_a_single_package():
+    transport = Transport()
+    assert notify(env=_env(UPCOMING_SEASON="2"), session=transport)
+    text = transport.calls[0][1]["json"]["text"]
+    assert "Your show recap is ready" in text and "One package:</b> Season 1 Recap" in text
+    assert "Both" not in text and "The Story So Far" not in text

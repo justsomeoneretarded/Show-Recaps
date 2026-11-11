@@ -15,6 +15,11 @@ from .models import RecapSpec, validate_script_scope
 KINDS = ("season", "series")
 
 
+def kinds_for(spec):
+    """Before Season 2 both recaps would cover only Season 1: make one video, not two copies."""
+    return ("season",) if spec.upcoming_season == 2 else KINDS
+
+
 def _read(path):
     try:
         value = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -89,7 +94,7 @@ def write_stage(shared):
         ledger = build_ledger(bundle, cache, writer)
         save_json(shared / "story-ledger.json", ledger)
         scripts = {}
-        for kind in KINDS:
+        for kind in kinds_for(spec):
             script = write_recap(kind, spec, bundle, ledger, cache, writer)
             draft = shared / f"{kind}-draft.json"
             save_json(draft, script)
@@ -113,7 +118,7 @@ def assets_stage(shared):
     shared = Path(shared)
     spec = load_spec(shared)
     bundle = _read(shared / "research.json")
-    for kind in KINDS:
+    for kind in kinds_for(spec):
         validate_script_scope(_read(shared / f"{kind}-script.json"), spec, bundle)
     assets = collect_assets(bundle, spec, (shared / "asset-cache").resolve())
     portable = _asset_paths(assets, shared, portable=True)
@@ -134,6 +139,9 @@ def render_stage(kind, shared, work, output, *, recovery=None):
         raise PipelineError("Choose one render kind: season or series.")
     shared = Path(shared)
     spec = load_spec(shared)
+    if kind not in kinds_for(spec):
+        raise PipelineError("Before Season 2 the series recap would repeat the Season 1 recap; "
+                            "only the season package is produced.")
     bundle = _read(shared / "research.json")
     script = _read(shared / f"{kind}-script.json")
     validate_script_scope(script, spec, bundle)

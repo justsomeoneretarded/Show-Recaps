@@ -5,7 +5,7 @@ One workflow makes two source-grounded recap packages before the next season of 
 - **Previous season:** the season immediately before the selected incoming season.
 - **The story so far:** every earlier season, connected into a broader series recap.
 
-For incoming Season 4, these cover Season 3 and Seasons 1–3. Neither includes Season 4 plot or later footage. Historical boundaries are supported too: an incoming-season selection describes the cutoff, not a claim about today's release schedule.
+For incoming Season 4, these cover Season 3 and Seasons 1–3. For incoming Season 2 both would cover only Season 1, so a single **show-recap-season** package is produced. Neither includes Season 4 plot or later footage. Historical boundaries are supported too: an incoming-season selection describes the cutoff, not a claim about today's release schedule.
 
 ## Run it
 

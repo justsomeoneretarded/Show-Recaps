@@ -13,7 +13,7 @@ from movie_pipeline.core import PipelineError, key, save_json
 from recap_pipeline.gemini import GeminiClient, GeminiUnavailable, configured_key
 from recap_pipeline.models import narration_within_scope
 
-POLICY_VERSION = 5
+POLICY_VERSION = 6
 MAX_EPISODES_PER_BATCH = 6
 MAX_BATCH_CHARS = 18000
 MAX_EPISODE_CHARS = 12000
@@ -58,6 +58,20 @@ _FORBIDDEN = re.compile(
     r"\b(?:(?:a|the)\s+must[- ]watch|worth (?:a|the) watch|"
     r"(?:stream(?:ing)?|watch)\s+(?:(?:it|now)\s+)?(?:on|via)\s+" + _PROVIDER
     + r"|available\s+(?:to\s+(?:stream|watch)\s+)?on\s+" + _PROVIDER + r")(?!\w)", re.I)
+
+
+NARRATION_STYLE = (
+    "Sound like an engaging YouTube recap narrator talking to a viewer, not an encyclopedia: "
+    "present tense, concrete active verbs, characters as the subjects of sentences, a mix of short "
+    "punchy sentences and longer ones, and natural spoken transitions such as 'but', 'so', 'then' "
+    "and 'meanwhile'. Avoid essay filler such as 'the situation escalates', 'during this period', "
+    "'in a desperate act', 'this action resulted in' and 'the dynamic shifts'. Style never licenses "
+    "new facts, motives or emotions beyond the evidence. ")
+DELIVERY_GUIDE = (
+    "Label each paragraph's delivery from its content: calm for setup, aftermath and reflection; "
+    "dramatic for deaths, betrayals, reveals, threats and cliffhangers; hype for victories, escapes "
+    "and action; normal otherwise. Vary delivery when the story genuinely changes tone; do not "
+    "label everything normal by default. ")
 
 
 class RecapWriter:
@@ -453,6 +467,7 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
             f"TASK: DRAFT_RECAP. Write {scope}. This section's purpose is {purpose}. "
             "Tell an original, connected story in spoken English: decisions lead to consequences, "
             "motives only when supported, and conflicts change the characters' positions. "
+            + NARRATION_STYLE +
             "For series mode connect earlier arcs to later consequences; for season mode explain "
             "the available turns in greater detail. Previous context is orientation, not permission "
             "to invent links. Focus on focus_event_ids; earlier events are citable context for links, "
@@ -468,6 +483,7 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
             "pitch where to watch it. A before/ahead-of-season reference may name the recap's cutoff "
             "without asserting incoming-season events. Retain ordinary plot references to rank, timed countdowns, "
             "character names such as Number One, and companies when the evidence supports them. "
+            + DELIVERY_GUIDE +
             "For ending purpose state where supported conflicts and characters were actually left, "
             "preserving unresolved questions; never promise an outcome. previous_context has ALREADY "
             "been narrated to the viewer: do not restate or summarise it again; open directly with the "
@@ -497,8 +513,8 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
             "Do not replace factual vocabulary with synonyms merely to avoid these words. "
             "Return supported true only if the FINAL edited text is entirely supported by its cited "
             "events; otherwise omit the paragraph or mark supported false and explain why. Empty "
-            "results are preferable to invention. Do not add facts from memory. Align delivery labels "
-            "to the tone of the final paragraph. Runtime is soft, no padding.",
+            "results are preferable to invention. Do not add facts from memory. Keep the narration style: "
+            + NARRATION_STYLE + DELIVERY_GUIDE + "Runtime is soft, no padding.",
             {**payload, "draft": {"title": draft.get("title", ""), "paragraphs": candidates}},
             _EDIT_SCHEMA, temperature=0.15, num_predict=5000)
         paragraphs = _paragraphs(edited, allowed, upcoming, reviewed=True)

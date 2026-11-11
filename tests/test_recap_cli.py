@@ -233,3 +233,30 @@ def test_rejected_script_keeps_diagnostic_draft_without_publishing_it(services, 
     assert not (services.shared/"season-script.json").exists()
     assert not (services.shared/"series-script.json").exists()
     assert services.events[-1] == ("unload",)
+
+
+def test_before_season_two_only_one_recap_is_written_and_rendered(services, monkeypatch):
+    monkeypatch.setenv("UPCOMING_SEASON", "2")
+    def season_one(kind):
+        script = _script(kind)
+        script["upcoming_season"], script["seasons"] = 2, [1]
+        story = {**script["sections"][0], "id": "story-1", "season": 1, "episode_ids": ["e1"], "event_ids": ["v1"]}
+        script["sections"] = [story, {**story, "id": "ending", "kind": "ending"}]
+        script["source_ids"] = ["s1"]
+        return script
+    def bundle():
+        value = _bundle()
+        value["seasons"], value["sources"] = value["seasons"][:1], value["sources"][:1]
+        return value
+    research = sys.modules["recap_pipeline.research"].research_show
+    sys.modules["recap_pipeline.research"].research_show = lambda spec, cache: (research(spec, cache), bundle())[1]
+    write = sys.modules["recap_pipeline.writing"].write_recap
+    sys.modules["recap_pipeline.writing"].write_recap = (
+        lambda kind, *args: (write(kind, *args), season_one(kind))[1])
+    assert set(cli.run_stage("prepare", services.shared, services.work, services.output)) == {"season"}
+    assert [event[1] for event in services.events if event[0] == "write"] == ["season"]
+    assert not (services.shared / "series-script.json").exists()
+    cli.run_stage("render", services.shared, services.work, services.output, kind="season")
+    with pytest.raises(PipelineError, match="only the season package"):
+        cli.run_stage("render", services.shared, services.work, services.output, kind="series")
+    assert [event[1] for event in services.events if event[0] == "render"] == ["season"]

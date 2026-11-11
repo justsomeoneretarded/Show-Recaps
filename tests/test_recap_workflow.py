@@ -13,7 +13,9 @@ def test_recap_workflow_two_outputs_share_one_frozen_prepare():
     assert inputs["season_minutes"]["options"]==["Auto",*map(str,range(1,31))]
     assert inputs["series_minutes"]["options"]==inputs["season_minutes"]["options"]
     assert data["jobs"]["render"]["needs"]=="prepare"
-    assert data["jobs"]["render"]["strategy"]["matrix"]["kind"]==["season","series"]
+    kinds=data["jobs"]["render"]["strategy"]["matrix"]["kind"]
+    assert kinds.startswith("${{ fromJSON(inputs.upcoming_season == 2 &&")
+    assert """'["season"]' || '["season", "series"]'""" in kinds
     assert data["jobs"]["render"]["strategy"]["fail-fast"]=="false"
     for job in data["jobs"].values():
         for step in job.get("steps",[]):
