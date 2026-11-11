@@ -42,6 +42,7 @@ Narration sits over a quiet, consistent licensed instrumental bed. Optional nati
 
 No paid inference API is required. Configure these under this repository's **Settings → Secrets and variables → Actions** when desired:
 
+- **GEMINI_API_KEY:** optional free Google AI Studio key. When set, Gemini writes, fact-checks and edits the scripts (much faster and more natural than the local model). The **Script AI** input chooses `auto` (Gemini, switching to the local model for the rest of the run if the free quota or service fails), `gemini` (Gemini only) or `local`. Set the repository *variable* **GEMINI_MODEL** to change the model (default `gemini-3-flash-preview`). Free-tier requests may be used by Google to improve its products; only public plot summaries are sent. Every Gemini claim still has to match a verbatim source quote.
 - **YOUTUBE_COOKIES:** optional downloader authentication. These are private and excluded from packages.
 - **TMDB_READ_TOKEN:** optional supplementary metadata/episode lookup.
 - **TELEGRAM_BOT_TOKEN** and **TELEGRAM_CHAT_ID:** optional completion reminder after both packages were uploaded. Channel pinning also needs the bot's appropriate channel rights.

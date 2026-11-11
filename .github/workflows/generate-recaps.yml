@@ -105,6 +105,11 @@ on:
         description: "Try up to 4K when the available visuals support it"
         type: boolean
         default: true
+      script_ai:
+        description: "Script AI: auto = Gemini if the GEMINI_API_KEY secret is set, else local; gemini = Gemini only; local = local model only"
+        type: choice
+        default: auto
+        options: [auto, gemini, local]
 permissions:
   contents: read
 concurrency:
@@ -121,6 +126,7 @@ env:
   SERIES_MINUTES: ${{ inputs.series_minutes }}
   TRY_4K: "${{ inputs.try_4k }}"
   SCRIPT_MODEL: gemma4:12b
+  RECAP_WRITER: ${{ inputs.script_ai }}
   HF_HOME: ${{ github.workspace }}/work/models/huggingface
   TORCH_HOME: ${{ github.workspace }}/work/models/torch
   HF_HUB_DISABLE_XET: "1"
@@ -131,6 +137,8 @@ jobs:
     timeout-minutes: 350
     env:
       TMDB_READ_TOKEN: ${{ secrets.TMDB_READ_TOKEN }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
       OLLAMA_HOST: 127.0.0.1:11435
       OLLAMA_URL: http://127.0.0.1:11435
       OLLAMA_NUM_PARALLEL: "1"
@@ -166,6 +174,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/warp_proxy.sh
       - name: Start the local writing model
+        # Also the automatic fallback when Gemini's free quota runs out; skipped only for Gemini-only runs.
+        if: inputs.script_ai != 'gemini'
         run: bash scripts/bootstrap_ollama.sh
       - name: Research once, write both recaps, collect scoped assets
         run: python -m recap_pipeline.cli --stage prepare

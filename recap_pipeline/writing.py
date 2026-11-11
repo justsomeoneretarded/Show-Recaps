@@ -10,6 +10,7 @@ from pathlib import Path
 import requests
 
 from movie_pipeline.core import PipelineError, key, save_json
+from recap_pipeline.gemini import GeminiClient, GeminiUnavailable, configured_key
 from recap_pipeline.models import narration_within_scope
 
 POLICY_VERSION = 5
@@ -60,15 +61,45 @@ _FORBIDDEN = re.compile(
 
 
 class RecapWriter:
-    """Ollama transport with a recap system context; it never calls Writer.narration."""
-    def __init__(self, cache_dir=None):
+    """Writing transport: Gemini when a key is configured, else the local Ollama model.
+
+    RECAP_WRITER=auto (default) prefers Gemini and switches to the local model for
+    the rest of the run if Gemini's quota or service fails. gemini and local force
+    one provider. It never calls Writer.narration.
+    """
+    def __init__(self, cache_dir=None, *, gemini=None):
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.url = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
-        self.model = os.getenv("RECAP_SCRIPT_MODEL", os.getenv("SCRIPT_MODEL", "gemma4:12b"))
+        self.local_model = os.getenv("RECAP_SCRIPT_MODEL", os.getenv("SCRIPT_MODEL", "gemma4:12b"))
+        self.mode = os.getenv("RECAP_WRITER", "auto").strip().lower() or "auto"
+        if self.mode not in ("auto", "gemini", "local"):
+            raise PipelineError("RECAP_WRITER must be auto, gemini or local.")
+        if gemini is None and self.mode != "local" and configured_key():
+            gemini = GeminiClient()
+        if self.mode == "gemini" and gemini is None:
+            raise PipelineError("RECAP_WRITER=gemini needs the GEMINI_API_KEY secret.")
+        self.gemini = None if self.mode == "local" else gemini
+        self.fell_back = False
+
+    @property
+    def model(self):
+        return self.gemini.model if self.gemini is not None else self.local_model
 
     def ask(self, prompt, schema, *, temperature=0.45, num_ctx=16384, num_predict=4000):
+        if self.gemini is not None:
+            try:
+                return self.gemini.generate_json(SYSTEM, prompt, schema, temperature=temperature)
+            except GeminiUnavailable as exc:
+                if self.mode == "gemini":
+                    raise
+                print(f"Gemini unavailable ({exc}); continuing with local model {self.local_model}.", flush=True)
+                self.gemini = None
+                self.fell_back = True
+        return self._ask_local(prompt, schema, temperature=temperature, num_ctx=num_ctx, num_predict=num_predict)
+
+    def _ask_local(self, prompt, schema, *, temperature, num_ctx, num_predict):
         response = requests.post(self.url + "/api/chat", json={
-            "model": self.model, "stream": False, "think": False, "format": schema,
+            "model": self.local_model, "stream": False, "think": False, "format": schema,
             "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
             "options": {"temperature": temperature, "num_ctx": num_ctx, "num_predict": num_predict},
             "keep_alive": "15m",
@@ -77,9 +108,9 @@ class RecapWriter:
         return json.loads(response.json()["message"]["content"])
 
     def unload(self):
-        """Release the writing model before loading the speech model."""
+        """Release the local writing model (if loaded) before loading the speech model."""
         response = requests.post(self.url + "/api/generate",
-                                 json={"model": self.model, "keep_alive": 0}, timeout=60)
+                                 json={"model": self.local_model, "keep_alive": 0}, timeout=60)
         response.raise_for_status()
 
 
@@ -106,7 +137,10 @@ def _cached(cache_dir, stage, writer, payload, generate):
         except (OSError, ValueError):
             pass
     result = generate()
-    save_json(path, result)
+    # A mid-call fallback changes the writer; file the result under the model that finished it.
+    save_json(Path(cache_dir) / (key("recap-writing", POLICY_VERSION, stage,
+                                     getattr(writer, "model", type(writer).__name__), payload) + ".json"),
+              result)
     return result
 
 
@@ -596,6 +630,8 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None):
                      "paragraphs": [OUTRO.format(upcoming=upcoming)], "delivery": ["calm"],
                      "episode_ids": [], "event_ids": [],
                      "paragraph_event_ids": [[]], "paragraph_episode_ids": [[]]})
+    if getattr(writer, "fell_back", False):
+        warnings.append("Gemini was unavailable for part of this run; the local model wrote the remainder.")
     referenced = list(dict.fromkeys(i for s in sections for i in s["event_ids"]))
     source_ids = list(dict.fromkeys(p["source_id"] for i in referenced for p in event_map[i]["evidence"]))
     represented = {e for s in sections for e in s["episode_ids"]}

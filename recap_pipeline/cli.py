@@ -185,7 +185,8 @@ def main(argv=None):
                   kind=args.kind, recovery=args.recovery)
     except PipelineError as exc:
         message = re.sub(r"https?://\S+", "[source URL]", str(exc))
-        for name in ("TELEGRAM_BOT_TOKEN", "TMDB_READ_TOKEN", "TMDB_API_KEY", "YOUTUBE_COOKIES"):
+        for name in ("TELEGRAM_BOT_TOKEN", "TMDB_READ_TOKEN", "TMDB_API_KEY", "YOUTUBE_COOKIES",
+                     "GEMINI_API_KEY", "GOOGLE_API_KEY"):
             secret = os.getenv(name, "")
             if secret:
                 message = message.replace(secret, "[redacted]")
