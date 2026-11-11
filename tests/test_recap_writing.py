@@ -6,7 +6,8 @@ import pytest
 from movie_pipeline.core import PipelineError
 from recap_pipeline.models import RecapSpec, validate_script_scope
 from recap_pipeline.writing import (
-    MAX_EPISODES_PER_BATCH, MAX_EVENT_CHARS, RecapWriter, build_ledger, write_recap,
+    MAX_EPISODES_PER_BATCH, MAX_EVENT_CHARS, OUTRO, RecapWriter, _without_repeated_ending,
+    build_ledger, write_recap,
 )
 
 
@@ -512,7 +513,7 @@ def test_written_recap_and_its_cutoff_outro_pass_final_scope_validation(tmp_path
     expected = {upcoming - 1} if kind == "season" else set(range(1, upcoming))
     assert validate_script_scope(output, request, bundle) == expected
     outro = next(section for section in output["sections"] if section["kind"] == "outro")
-    assert outro["paragraphs"] == [f"That is where the story stands before season {upcoming}."]
+    assert outro["paragraphs"] == [OUTRO.format(upcoming=upcoming)]
     assert_valid_citations(output, bundle, ledger, expected)
 
 
@@ -543,3 +544,60 @@ def test_editor_supported_flag_cannot_authorize_future_scope(tmp_path, text):
         {**data["draft"]["paragraphs"][0], "text": text, "supported": True, "reason": ""}]}
     with pytest.raises(PipelineError, match="No verified story narration"):
         write_recap("season", spec(2), bundle, ledger, tmp_path / "script", writer=model)
+
+
+def _ending_fixture(paragraphs, ending_ids):
+    event_map = {"story": {"episode_id": "1", "ending_state": False},
+                 "end": {"episode_id": "9", "ending_state": True},
+                 "late": {"episode_id": "9", "ending_state": False}}
+    story = {"id": "story-s1-1", "kind": "story", "title": "Season 1", "season": 1,
+             "paragraphs": [
+                 "This success grants Dylan access to the security office, where he activates the "
+                 "overtime contingency. As a result, the innies of Mark, Irving, and Helly are awakened "
+                 "in the outside world: Mark wakes up at a party, Irving at his apartment, and Helly at a gala.",
+                 "Helly takes the stage at a gala to reveal herself as an innie, decrying the severance "
+                 "process as a torturous experience before being tackled by Natalie."],
+             "delivery": ["normal", "normal"], "episode_ids": ["1"], "event_ids": ["story"],
+             "paragraph_event_ids": [["story"], ["story"]], "paragraph_episode_ids": [["1"], ["1"]]}
+    ending = {"id": "where-we-left-off-1", "kind": "ending", "title": "Where we left off", "season": 1,
+              "paragraphs": paragraphs, "delivery": ["normal"] * len(paragraphs),
+              "episode_ids": ["9"], "event_ids": sorted({i for ids in ending_ids for i in ids}),
+              "paragraph_event_ids": ending_ids, "paragraph_episode_ids": [["9"]] * len(paragraphs)}
+    return [story, ending], event_map
+
+
+def test_ending_drops_sentences_that_retell_the_story_but_keeps_new_final_state():
+    sections, event_map = _ending_fixture([
+        "Dylan activated the overtime contingency, and the innies of Mark, Irving and Helly awakened "
+        "in the outside world. Helly took the stage at a gala to reveal herself as an innie before "
+        "Natalie tackled her.",
+        "Mark discovered a wedding photo and realized that Gemma was alive as Ms. Casey. Milchick "
+        "broke into the security room and tackled Dylan, halting the overtime contingency."],
+        [["late"], ["end"]])
+    result = _without_repeated_ending(sections, event_map)
+    ending = result[-1]
+    assert ending["paragraphs"] == [sections[1]["paragraphs"][1]]
+    assert ending["paragraph_event_ids"] == [["end"]]
+    assert ending["delivery"] == ["normal"]
+    assert result[0] is sections[0]
+
+
+def test_ending_is_never_removed_even_when_every_sentence_repeats():
+    repeated = ("Dylan activates the overtime contingency in the security office, and the innies of Mark, "
+                "Irving and Helly are awakened in the outside world.")
+    sections, event_map = _ending_fixture([repeated], [["end"]])
+    ending = _without_repeated_ending(sections, event_map)[-1]
+    assert ending["paragraphs"] == [repeated]
+    assert ending["paragraph_event_ids"] == [["end"]]
+
+
+@pytest.mark.parametrize("upcoming", [2, 4])
+def test_intro_is_spoken_naturally_and_stays_within_scope(tmp_path, upcoming):
+    bundle, model = bundle_with_seasons(upcoming - 1, 1), Model()
+    request = RecapSpec(show_title="The Gate", premiere_year=2021, upcoming_season=upcoming)
+    ledger = build_ledger(bundle, tmp_path / "ledger", writer=model)
+    output = write_recap("series", request, bundle, ledger, tmp_path / "script", writer=model)
+    intro = output["sections"][0]["paragraphs"][0]
+    assert intro.startswith("Spoilers ahead.") and f"before season {upcoming}." in intro
+    assert ("seasons 1 through" in intro) is (upcoming > 2)
+    validate_script_scope(output, request, bundle)

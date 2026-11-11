@@ -12,7 +12,7 @@ import requests
 from movie_pipeline.core import PipelineError, key, save_json
 from recap_pipeline.models import narration_within_scope
 
-POLICY_VERSION = 4
+POLICY_VERSION = 5
 MAX_EPISODES_PER_BATCH = 6
 MAX_BATCH_CHARS = 18000
 MAX_EPISODE_CHARS = 12000
@@ -332,6 +332,72 @@ def _section(section_id, kind, title, season, paragraphs, event_map):
                                       for p in paragraphs]}
 
 
+OUTRO = "And that is where we left things. You are all caught up before season {upcoming}."
+REPEAT_THRESHOLD = 0.6
+MIN_REPEAT_WORDS = 5
+_STOP = frozenset(
+    "a an and are as at be been but by for from had has have he her his in into is it its of on or "
+    "she that the their them then there they this to was were when where which while who with "
+    "after before during also both each than so".split())
+
+
+def _sentences(text):
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+
+
+def _content(text):
+    words = set()
+    for word in re.findall(r"[a-z0-9]+", text.lower().replace("'s", "")):
+        if word in _STOP or len(word) < 3:
+            continue
+        for suffix in ("ing", "ed", "es", "s"):
+            if len(word) > len(suffix) + 3 and word.endswith(suffix):
+                word = word[:-len(suffix)]
+                break
+        words.add(word)
+    return words
+
+
+def _repeats(sentence, told):
+    words = _content(sentence)
+    if len(words) < MIN_REPEAT_WORDS:
+        return False
+    return any(len(words & earlier) / len(words) >= REPEAT_THRESHOLD for earlier in told)
+
+
+def _without_repeated_ending(sections, event_map):
+    """Drop ending sentences that retell story already narrated earlier in the video.
+
+    Removing whole sentences from verified paragraphs cannot add claims. A
+    paragraph left empty is dropped only while another paragraph still cites a
+    verified ending state, so the ending section can never disappear here.
+    """
+    told = [_content(sentence) for section in sections if section["kind"] == "story"
+            for paragraph in section["paragraphs"] for sentence in _sentences(paragraph)]
+    result = []
+    for section in sections:
+        if section["kind"] != "ending" or not told:
+            result.append(section)
+            continue
+        kept = []
+        for index, paragraph in enumerate(section["paragraphs"]):
+            fresh = [s for s in _sentences(paragraph) if not _repeats(s, told)]
+            text = " ".join(fresh)
+            kept.append({"text": text or paragraph, "empty": not fresh,
+                         "event_ids": section["paragraph_event_ids"][index],
+                         "delivery": section["delivery"][index]})
+        def ending(paragraph):
+            return any(event_map[i].get("ending_state") for i in paragraph["event_ids"])
+        survivors = [p for p in kept if not p["empty"]]
+        if not any(ending(p) for p in survivors):
+            # Everything was a retelling: keep the verified text rather than lose the ending.
+            survivors = kept
+        result.append(_section(section["id"], "ending", section["title"], section["season"],
+                               [{key: p[key] for key in ("text", "event_ids", "delivery")}
+                                for p in survivors], event_map))
+    return result
+
+
 def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previous,
                    prior_events=None, research_quality=None, runtime_share=None):
     focus_ids = [e["id"] for e in events]
@@ -369,7 +435,9 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
             "without asserting incoming-season events. Retain ordinary plot references to rank, timed countdowns, "
             "character names such as Number One, and companies when the evidence supports them. "
             "For ending purpose state where supported conflicts and characters were actually left, "
-            "preserving unresolved questions; never promise an outcome. Ending paragraphs must cite at "
+            "preserving unresolved questions; never promise an outcome. previous_context has ALREADY "
+            "been narrated to the viewer: do not restate or summarise it again; open directly with the "
+            "final turns and the state they leave. Ending paragraphs must cite at "
              "least one supplied event with ending_state true, and must not promote an earlier "
              "temporary event into an ending. Return title and paragraphs.",
             payload, _DRAFT_SCHEMA, temperature=0.5, num_predict=5000)
@@ -453,7 +521,12 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None):
     title_tail = f": {scope}{' Story' if kind == 'series' else ''} Recap — Before Season {upcoming}"
     short_show = show[:max(1, 100 - len(title_tail))].rstrip()
     title = short_show + title_tail
-    intro = f"Previously on {show}: {scope.lower()}."
+    if len(seasons) == 1:
+        intro = (f"Spoilers ahead. Here is everything that happened in {show} season {seasons[0]}, "
+                 f"so you are ready before season {upcoming}.")
+    else:
+        intro = (f"Spoilers ahead. Here is the whole story of {show} so far, seasons 1 through "
+                 f"{seasons[-1]}, so you are ready before season {upcoming}.")
     sections = [{"id": "intro", "kind": "intro", "title": "The story so far", "season": None,
                  "paragraphs": [intro], "delivery": ["normal"], "episode_ids": [], "event_ids": [],
                  "paragraph_event_ids": [[]], "paragraph_episode_ids": [[]]}]
@@ -515,11 +588,12 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None):
                 warnings.append("The final episode's ending state could not be verified; no resolution was invented.")
     else:
         warnings.append("No supported final-episode ending state was available; where we left off is incomplete.")
+    sections = _without_repeated_ending(sections, event_map)
     if not any(section["kind"] == "ending" for section in sections):
         raise PipelineError("The final episode's ending state could not be narrated with factual support; "
                             "no recap video was produced.")
     sections.append({"id": "outro", "kind": "outro", "title": "Until the story continues", "season": None,
-                     "paragraphs": [f"That is where the story stands before season {upcoming}."], "delivery": ["calm"],
+                     "paragraphs": [OUTRO.format(upcoming=upcoming)], "delivery": ["calm"],
                      "episode_ids": [], "event_ids": [],
                      "paragraph_event_ids": [[]], "paragraph_episode_ids": [[]]})
     referenced = list(dict.fromkeys(i for s in sections for i in s["event_ids"]))
