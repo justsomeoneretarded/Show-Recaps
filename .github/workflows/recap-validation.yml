@@ -91,6 +91,8 @@ jobs:
       RECAP_RESUME_LEDGER: "${{ contains(github.event.head_commit.message, '[recap-resume-ledger]') }}"
       SCRIPT_MODEL: gemma4:12b
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+      GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
       GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
       OLLAMA_HOST: 127.0.0.1:11435
       OLLAMA_URL: http://127.0.0.1:11435

@@ -86,7 +86,7 @@ def test_persistent_quota_failure_is_reported_as_unavailable():
 
 def test_bad_key_fails_fast_without_retrying_or_falling_back():
     c, session, sleeps = client(Response(403))
-    with pytest.raises(PipelineError, match="Check GEMINI_API_KEY") as error:
+    with pytest.raises(PipelineError, match="GEMINI_API_KEY") as error:
         c.generate_json("s", "p", {"type": "object"})
     assert not isinstance(error.value, GeminiUnavailable)
     assert sleeps == [] and "secret-key" not in str(error.value)
@@ -170,3 +170,43 @@ def test_after_an_exhausted_retry_cycle_no_further_calls_are_made():
     with pytest.raises(GeminiUnavailable, match="earlier in this run"):
         c.generate_json("s", "p", {"type": "object"})
     assert len(session.calls) == calls
+
+
+def _keyed(*responses, keys=("k1", "k2", "k3")):
+    sleeps, session = [], Session(*responses)
+    return GeminiClient(keys=list(keys), session=session, sleep=sleeps.append), session, sleeps
+
+
+def test_quota_hit_switches_to_a_spare_key_without_waiting():
+    c, session, sleeps = _keyed(Response(429), ok({"ok": 1}))
+    assert c.generate_json("s", "p", {"type": "object"}) == {"ok": 1}
+    assert [call[1]["headers"]["x-goog-api-key"] for call in session.calls] == ["k1", "k2"]
+    assert sleeps == [] and c.key == "k2"  # later requests stay on the working key
+
+
+def test_all_keys_limited_waits_then_retries():
+    c, session, sleeps = _keyed(Response(429), Response(429), Response(429), ok({"ok": 1}))
+    assert c.generate_json("s", "p", {"type": "object"}) == {"ok": 1}
+    assert len(session.calls) == 4 and len(sleeps) == 1
+
+
+def test_rejected_key_is_dropped_and_a_spare_is_used():
+    c, session, _ = _keyed(Response(403), ok({"ok": 1}), keys=("bad", "good"))
+    assert c.generate_json("s", "p", {"type": "object"}) == {"ok": 1}
+    assert c.keys == ["good"]
+
+
+def test_every_key_rejected_fails_clearly():
+    c, _, _ = _keyed(Response(403), Response(401), keys=("a", "b"))
+    with pytest.raises(PipelineError, match="every configured key"):
+        c.generate_json("s", "p", {"type": "object"})
+
+
+def test_spare_keys_are_read_from_the_environment(monkeypatch):
+    from recap_pipeline.gemini import configured_keys
+    monkeypatch.setenv("GEMINI_API_KEY", "a")
+    monkeypatch.setenv("GEMINI_API_KEY_2", "b")
+    monkeypatch.setenv("GEMINI_API_KEY_3", "a")
+    assert configured_keys() == ["a", "b"]
+    monkeypatch.delenv("GEMINI_API_KEY")
+    assert configured_keys() == ["b", "a"] and GeminiClient().key == "b"

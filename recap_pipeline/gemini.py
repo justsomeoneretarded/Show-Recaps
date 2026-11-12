@@ -32,9 +32,19 @@ class GeminiUnavailable(PipelineError):
     """Quota, outage or unusable output: a local model may take over."""
 
 
-def configured_key(env=None):
+KEY_NAMES = ("GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GOOGLE_API_KEY")
+
+
+def configured_keys(env=None):
+    """Every configured key, primary first; spares take over when one hits its limit."""
     env = os.environ if env is None else env
-    return (env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY") or "").strip()
+    keys = [str(env.get(name) or "").strip() for name in KEY_NAMES]
+    return list(dict.fromkeys(key for key in keys if key))
+
+
+def configured_key(env=None):
+    keys = configured_keys(env)
+    return keys[0] if keys else ""
 
 
 def _retry_delay(response, attempt):
@@ -69,8 +79,10 @@ def _text(payload):
 
 
 class GeminiClient:
-    def __init__(self, key=None, model=None, *, session=None, sleep=time.sleep):
-        self.key = key if key is not None else configured_key()
+    def __init__(self, key=None, model=None, *, session=None, sleep=time.sleep, keys=None):
+        self.keys = list(keys) if keys is not None else ([key] if key is not None else configured_keys())
+        self.keys = [k for k in self.keys if k]
+        self.index = 0
         self.model = (model or os.getenv("GEMINI_MODEL") or DEFAULT_MODEL).strip()
         self.session = session or requests.Session()
         self.sleep = sleep
@@ -79,6 +91,20 @@ class GeminiClient:
         # After one exhausted retry cycle (daily quota, outage) stop asking for the rest of the
         # run, so optional calls cannot add hours of backoff.
         self.unavailable = False
+
+    @property
+    def key(self):
+        return self.keys[self.index] if self.keys else ""
+
+    def _next_key(self, tried):
+        """Switch to a key not yet tried in this request; False when all were tried."""
+        for offset in range(1, len(self.keys)):
+            candidate = (self.index + offset) % len(self.keys)
+            if candidate not in tried:
+                self.index = candidate
+                print(f"Gemini key {len(tried)} hit its limit; switching to spare key {candidate + 1}.", flush=True)
+                return True
+        return False
 
     def generate_json(self, system, prompt, schema, *, temperature=None, max_tokens=32768,
                       media=None, media_resolution=None):
@@ -101,7 +127,9 @@ class GeminiClient:
                 "generationConfig": config, "safetySettings": SAFETY}
         url = f"{API_ROOT}/{self.model}:generateContent"
         last_problem = "no attempt was made"
-        for attempt in range(MAX_ATTEMPTS):
+        tried = {self.index}
+        attempt = 0
+        while attempt < MAX_ATTEMPTS:
             wait = self.min_interval - (time.monotonic() - self._last)
             if wait > 0:
                 self.sleep(wait)
@@ -113,7 +141,17 @@ class GeminiClient:
             except requests.RequestException as exc:
                 last_problem = type(exc).__name__
             if response is not None:
-                if response.status_code in (400, 401, 403, 404):
+                if response.status_code in (401, 403):
+                    # A revoked or wrong key is dropped; the spares carry on.
+                    self.keys.pop(self.index)
+                    self.index = 0
+                    tried = {0}
+                    if not self.keys:
+                        raise PipelineError(f"Gemini rejected every configured key (HTTP {response.status_code}). "
+                                            "Check the GEMINI_API_KEY secrets.")
+                    print(f"A Gemini key was rejected (HTTP {response.status_code}); using a spare key.", flush=True)
+                    continue
+                if response.status_code in (400, 404):
                     raise PipelineError(
                         f"Gemini rejected the request (HTTP {response.status_code}). Check GEMINI_API_KEY "
                         f"and that model {self.model} is available to this key.")
@@ -127,8 +165,13 @@ class GeminiClient:
                         last_problem = f"unusable response ({type(exc).__name__})"
                 else:
                     last_problem = f"HTTP {response.status_code}"
-            if attempt + 1 < MAX_ATTEMPTS:
-                self.sleep(_retry_delay(response, attempt))
+                    if response.status_code == 429 and self._next_key(tried):
+                        tried.add(self.index)
+                        continue  # a spare key with its own quota: no waiting
+            attempt += 1
+            tried = {self.index}
+            if attempt < MAX_ATTEMPTS:
+                self.sleep(_retry_delay(response, attempt - 1))
         self.unavailable = True
         raise GeminiUnavailable(f"Gemini was unavailable after {MAX_ATTEMPTS} attempts: {last_problem}.")
 
