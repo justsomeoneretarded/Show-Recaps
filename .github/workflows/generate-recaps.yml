@@ -30,7 +30,7 @@ on:
         default: original
         options: [original, turbo, nano]
       season_minutes:
-        description: "Previous-season recap length in minutes (soft ±25%)"
+        description: "Previous-season recap length in minutes (soft ±25%, never above 20)"
         type: choice
         default: Auto
         options:
@@ -55,18 +55,8 @@ on:
           - '18'
           - '19'
           - '20'
-          - '21'
-          - '22'
-          - '23'
-          - '24'
-          - '25'
-          - '26'
-          - '27'
-          - '28'
-          - '29'
-          - '30'
       series_minutes:
-        description: "Whole-series recap length in minutes (soft ±25%)"
+        description: "Whole-series recap length in minutes (soft ±25%, never above 20)"
         type: choice
         default: Auto
         options:
@@ -91,25 +81,15 @@ on:
           - '18'
           - '19'
           - '20'
-          - '21'
-          - '22'
-          - '23'
-          - '24'
-          - '25'
-          - '26'
-          - '27'
-          - '28'
-          - '29'
-          - '30'
       try_4k:
         description: "Try up to 4K when the available visuals support it"
         type: boolean
         default: true
-      script_ai:
-        description: "Script AI: auto = Gemini if the GEMINI_API_KEY secret is set, else local; gemini = Gemini only; local = local model only"
+      voice_speed:
+        description: "Voice-over speed (1.0 = natural; higher is faster)"
         type: choice
-        default: auto
-        options: [auto, gemini, local]
+        default: '1.0'
+        options: ['0.9', '1.0', '1.1', '1.15', '1.2', '1.25', '1.3']
 permissions:
   contents: read
 concurrency:
@@ -126,7 +106,10 @@ env:
   SERIES_MINUTES: ${{ inputs.series_minutes }}
   TRY_4K: "${{ inputs.try_4k }}"
   SCRIPT_MODEL: gemma4:12b
-  RECAP_WRITER: ${{ inputs.script_ai }}
+  VOICE_SPEED: ${{ inputs.voice_speed }}
+  # auto (Gemini when the key is set), gemini or local; set as a repository variable.
+  RECAP_WRITER: ${{ vars.RECAP_WRITER || 'auto' }}
+  RECAP_MAX_CLIPS_PER_SEASON: ${{ vars.RECAP_MAX_CLIPS_PER_SEASON || '14' }}
   HF_HOME: ${{ github.workspace }}/work/models/huggingface
   TORCH_HOME: ${{ github.workspace }}/work/models/torch
   HF_HUB_DISABLE_XET: "1"
@@ -175,7 +158,7 @@ jobs:
         run: bash scripts/warp_proxy.sh
       - name: Start the local writing model
         # Also the automatic fallback when Gemini's free quota runs out; skipped only for Gemini-only runs.
-        if: inputs.script_ai != 'gemini'
+        if: vars.RECAP_WRITER != 'gemini'
         run: bash scripts/bootstrap_ollama.sh
       - name: Research once, write both recaps, collect scoped assets
         run: python -m recap_pipeline.cli --stage prepare
@@ -215,6 +198,9 @@ jobs:
     timeout-minutes: 350
     env:
       RECAP_KIND: ${{ matrix.kind }}
+      # Gemini ranks logged scenes for each narrated paragraph.
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
     steps:
       - uses: actions/checkout@v4
       - run: python3 -m scripts.runner_disk --stage produce

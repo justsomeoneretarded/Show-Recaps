@@ -1,7 +1,9 @@
 """Conservative, season-scoped recap visuals with bounded optional downloads.
 
 A video must establish both the requested show and one prior season in provider
-metadata. Search rank never supplies evidence. No model chooses footage identity.
+metadata. Search rank never supplies evidence. No model chooses footage identity:
+Gemini may suggest extra searches and log what each accepted clip shows, but the
+metadata checks below alone decide whether a clip belongs to a season.
 """
 from __future__ import annotations
 
@@ -18,18 +20,19 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 from movie_pipeline import download_access
 from movie_pipeline.core import PipelineError, normalized, probe
 from movie_pipeline.video_settings import require_disk
 
-CACHE_VERSION = 2
-MAX_VIDEOS = 2
-MAX_CANDIDATES = 8
-MAX_DOWNLOAD_ATTEMPTS = 4
+CACHE_VERSION = 3
+MAX_VIDEOS = 14
+MAX_CANDIDATES = 60
+MAX_DOWNLOAD_ATTEMPTS = 30
+SEARCH_RESULTS = 8
 MAX_VIDEO_BYTES = 400_000_000
-MAX_RUN_BYTES = 2_400_000_000
+MAX_RUN_BYTES = 9_000_000_000
 MAX_IMAGE_BYTES = 12_000_000
 MAX_IMAGE_FAILURES = 6
 MAX_IMAGE_ATTEMPTS = 48
@@ -80,9 +83,25 @@ def _show_named(title: str, show_title: str) -> bool:
             or bool(re.fullmatch(r"(?:19|20)\d{2}", first)))
 
 
+def _upload_in(info: dict, window) -> bool:
+    if not window:
+        return False
+    raw = str(info.get("upload_date") or "")
+    try:
+        uploaded = date(int(raw[:4]), int(raw[4:6]), int(raw[6:8]))
+    except ValueError:
+        return False
+    low, high = window
+    return low <= uploaded <= high
+
+
 def candidate_ok(info: dict, show: dict, season: int, upcoming_season: int,
-                 season_year: int | None = None) -> bool:
-    """Reject ambiguity, incoming seasons, other shows and commentary before download."""
+                 season_year: int | None = None, window=None) -> bool:
+    """Reject ambiguity, incoming seasons, other shows and commentary before download.
+
+    A clip naming no season at all is accepted only when ``window`` (this season's
+    airing window, ending well before any later season) contains its upload date.
+    """
     title = str(info.get("title") or "")
     description = str(info.get("description") or "")
     try:
@@ -101,7 +120,7 @@ def candidate_ok(info: dict, show: dict, season: int, upcoming_season: int,
     if declared_series and normalized(str(declared_series)) != normalized(str(show.get("title") or "")):
         return False
     refs = _season_numbers(title + " " + description)
-    if refs != {season}:
+    if refs != {season} and not (not refs and _upload_in(info, window)):
         return False
     explicit_season = info.get("season_number")
     if explicit_season is not None and str(explicit_season).lstrip("0") != str(season):
@@ -151,6 +170,26 @@ def search_queries(show: dict, season: int) -> list[str]:
     return [f"{prefix} official trailer", f"{prefix} best scenes", f"{prefix} {scene}"]
 
 
+def extra_queries(show: dict, season: dict) -> list[str]:
+    """More official-footage searches: clips, sneak peeks, teasers and episode titles."""
+    number = int(season["number"])
+    prefix = f'"{show["title"]}" "season {number}"'
+    queries = [f"{prefix} official clip", f"{prefix} sneak peek", f"{prefix} teaser",
+               f"{prefix} scene", f'{show["title"]} season {number} clip']
+    titles = [str(e.get("title") or "").strip() for e in season.get("episodes") or []]
+    queries += [f'{prefix} "{title}" clip' for title in titles if title][:8]
+    return queries
+
+
+def _all_queries(show: dict, season: dict, client=None) -> list[str]:
+    from .gemini_media import suggest_queries
+    number = int(season["number"])
+    titles = [str(e.get("title") or "") for e in season.get("episodes") or []]
+    queries = [*search_queries(show, number), *suggest_queries(client, show, number, titles),
+               *extra_queries(show, season)]
+    return list(dict.fromkeys(queries))
+
+
 def _url(entry: dict) -> str | None:
     identifier = str(entry.get("id") or "")
     if re.fullmatch(r"[\w-]{11}", identifier):
@@ -193,9 +232,49 @@ def _video_info(path: Path) -> dict:
     return {"width": width, "height": height, "duration": seconds}
 
 
+def season_windows(seasons: list[dict]) -> dict[int, tuple]:
+    """Upload windows for clips that name no season: from 90 days before a season's
+    premiere until 150 days after its finale, and always before the next season."""
+    from datetime import timedelta
+    spans = {}
+    for row in seasons:
+        days = []
+        for episode in row.get("episodes") or []:
+            try:
+                days.append(date.fromisoformat(str(episode.get("airdate") or "")[:10]))
+            except ValueError:
+                continue
+        if days:
+            spans[int(row["number"])] = (min(days), max(days))
+    result = {}
+    for number, (first, last) in spans.items():
+        high = last + timedelta(days=150)
+        following = [spans[n][0] for n in spans if n > number]
+        if following:
+            high = min(high, min(following) - timedelta(days=200))
+        low = first - timedelta(days=90)
+        if high > low:
+            result[number] = (low, high)
+    return result
+
+
+def _clip_limit() -> int:
+    try:
+        limit = int(os.environ.get("RECAP_MAX_CLIPS_PER_SEASON", str(MAX_VIDEOS)))
+    except (TypeError, ValueError) as exc:
+        raise PipelineError("RECAP_MAX_CLIPS_PER_SEASON must be an integer from 1 to 30.") from exc
+    if not 1 <= limit <= 30:
+        raise PipelineError("RECAP_MAX_CLIPS_PER_SEASON must be an integer from 1 to 30.")
+    return limit
+
+
 def _discover_videos(show: dict, season: dict, incoming: int, root: Path,
-                     ceiling: int, budget: _Budget, warnings: list[str]) -> list[dict]:
+                     ceiling: int, budget: _Budget, warnings: list[str], client=None,
+                     window=None) -> list[dict]:
     import yt_dlp
+
+    max_videos = _clip_limit()
+    max_attempts = MAX_DOWNLOAD_ATTEMPTS
 
     number = int(season["number"])
     seen: set[str] = set()
@@ -207,18 +286,18 @@ def _discover_videos(show: dict, season: dict, incoming: int, root: Path,
     for route in download_access.routes()[:2]:
         common = download_access.options(base, route)
         blocked = False
-        for query in search_queries(show, number):
-            if blocked or len(seen) >= MAX_CANDIDATES or attempts >= MAX_DOWNLOAD_ATTEMPTS or len(accepted) >= MAX_VIDEOS:
+        for query in _all_queries(show, season, client):
+            if blocked or len(seen) >= MAX_CANDIDATES or attempts >= max_attempts or len(accepted) >= max_videos:
                 break
             try:
                 with yt_dlp.YoutubeDL({**common, "extract_flat": True}) as ydl:
-                    results = ydl.extract_info(f"ytsearch4:{query}", download=False) or {}
+                    results = ydl.extract_info(f"ytsearch{SEARCH_RESULTS}:{query}", download=False) or {}
             except (yt_dlp.utils.DownloadError, OSError, ValueError) as exc:
                 blocked = _blocked(exc)
                 continue
-            for entry in (results.get("entries") or [])[:4]:
-                if (blocked or len(seen) >= MAX_CANDIDATES or attempts >= MAX_DOWNLOAD_ATTEMPTS
-                        or len(accepted) >= MAX_VIDEOS):
+            for entry in (results.get("entries") or [])[:SEARCH_RESULTS]:
+                if (blocked or len(seen) >= MAX_CANDIDATES or attempts >= max_attempts
+                        or len(accepted) >= max_videos):
                     break
                 if not isinstance(entry, dict):
                     continue
@@ -235,7 +314,7 @@ def _discover_videos(show: dict, season: dict, incoming: int, root: Path,
                         seen.add(url)
                     continue
                 seen.add(url)
-                if not candidate_ok(info, show, number, incoming, season.get("year")):
+                if not candidate_ok(info, show, number, incoming, season.get("year"), window):
                     continue
                 attempts += 1
                 if budget.used + MAX_VIDEO_BYTES > MAX_RUN_BYTES:
@@ -274,7 +353,8 @@ def _discover_videos(show: dict, season: dict, incoming: int, root: Path,
                         destination = root / f"video-{_hash(url)}.mp4"
                         attempt.replace(destination)
                         evidence = {key: info.get(key) for key in
-                                    ("title", "description", "duration", "series", "season_number", "imdb_id", "tvdb_id")}
+                                    ("title", "description", "duration", "series", "season_number", "imdb_id", "tvdb_id",
+                                     "upload_date")}
                         accepted.append({"path": str(destination.resolve()), "source_url": url,
                                          "title": str(info.get("title") or ""), "season": number,
                                          "kind": "video", **metadata, "episode_ids": [],
@@ -286,7 +366,7 @@ def _discover_videos(show: dict, season: dict, incoming: int, root: Path,
                         if blocked:
                             # This metadata-verified candidate remains retryable via a configured route.
                             seen.discard(url)
-        if len(accepted) >= MAX_VIDEOS or not blocked:
+        if len(accepted) >= max_videos or not blocked:
             break
         warnings.append(f"Season {number}: optional video provider blocked the {route} route; trying available fallback sources.")
     return accepted
@@ -475,39 +555,11 @@ def _fallback_images(show: dict, season: dict, root: Path, budget: _Budget,
                 return records
             except (requests.RequestException, OSError, ValueError, PipelineError, Image.DecompressionBombError):
                 destination.unlink(missing_ok=True)
-    destination = root / "neutral-title-card.jpg"
-    _neutral_card(show["title"], number, destination)
     if stopped:
         warnings.append(f"Season {number}: image collection stopped at {', '.join(sorted(stopped))}.")
-    warnings.append(f"Season {number}: no verified season imagery was reachable. Using a neutral illustrative title plate with no actors or plot imagery; the generic current show poster was excluded.")
-    return [{"path": str(destination.resolve()), "source_url": "",
-             "title": f"{show['title']} — season {number} neutral title plate",
-             "season": number, "kind": "image", "width": 1280, "height": 720,
-             "episode_ids": [], "scope": "neutral-title-card", "illustrative": True}]
-
-
-def _neutral_card(title: str, season: int, destination: Path):
-    require_disk(destination.parent)
-    image = Image.new("RGB", (1280, 720), "#111923")
-    draw = ImageDraw.Draw(image)
-    draw.rectangle((10, 10, 1269, 709), outline="#72b7b4", width=3)
-    def font(size):
-        for path in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                     "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"):
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                pass
-        return ImageFont.load_default()
-    headline = " ".join(str(title).split())[:150]
-    size = 76
-    while size > 18 and draw.textbbox((0, 0), headline, font=font(size))[2] > 1120:
-        size -= 2
-    draw.text((80, 240), headline, fill="white", font=font(size))
-    draw.text((80, 350), f"Season {season} Recap", fill="#72b7b4", font=font(55))
-    draw.text((80, 590), "ILLUSTRATIVE TITLE PLATE · SEASON IMAGERY UNAVAILABLE",
-              fill="#b4bec9", font=font(22))
-    image.save(destination, format="JPEG", quality=94)
+    warnings.append(f"Season {number}: no verified season footage or imagery was reachable; "
+                    "footage from another covered season will be used instead of a blank plate.")
+    return []
 
 
 def _fingerprint(show: dict, season: dict) -> str:
@@ -516,7 +568,7 @@ def _fingerprint(show: dict, season: dict) -> str:
                   for e in _episode_rows(season)], show.get("image"), show.get("image_season"))
 
 
-def _cached(manifest: Path, show: dict, season: dict, incoming: int) -> list[dict] | None:
+def _cached(manifest: Path, show: dict, season: dict, incoming: int, window=None) -> list[dict] | None:
     try:
         record = json.loads(manifest.read_text(encoding="utf-8"))
         # Legacy sparse pools must pass the same identity/provenance checks before enrichment.
@@ -532,7 +584,8 @@ def _cached(manifest: Path, show: dict, season: dict, incoming: int) -> list[dic
                     or path.parent.resolve() != manifest.parent.resolve()):
                 return None
             if asset.get("kind") == "video":
-                if not candidate_ok(asset.get("metadata") or {}, show, int(season["number"]), incoming, season.get("year")):
+                if not candidate_ok(asset.get("metadata") or {}, show, int(season["number"]), incoming,
+                                    season.get("year"), window):
                     return None
                 asset.update(_video_info(path))
                 asset["identity_evidence"] = _identity_evidence(asset.get("metadata") or {}, show)
@@ -551,8 +604,8 @@ def _cached(manifest: Path, show: dict, season: dict, incoming: int) -> list[dic
                     provenance = poster.get("season") if isinstance(poster, dict) else show.get("image_season")
                     if str(provenance) != str(season["number"]) or asset.get("source_url") != _image_url(poster):
                         return None
-                elif (asset.get("scope") != "neutral-title-card" or not asset.get("illustrative")
-                      or asset.get("source_url") or asset.get("episode_ids")):
+                else:
+                    # Old neutral title plates are never reused: rediscover real footage.
                     return None
             else:
                 return None
@@ -561,12 +614,88 @@ def _cached(manifest: Path, show: dict, season: dict, incoming: int) -> list[dic
         return None
 
 
+def _letterbox_crop(path: Path) -> str | None:
+    """FFmpeg crop filter that removes baked-in black bars, or None when there are none."""
+    import subprocess
+    try:
+        info = _video_info(path)
+    except PipelineError:
+        return None
+    width, height, seconds = info["width"], info["height"], info["duration"]
+    found = []
+    for fraction in (0.25, 0.5, 0.75):
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-ss", f"{seconds * fraction:.2f}", "-i", str(path), "-t", "3",
+                 "-vf", "cropdetect=limit=24:round=2:reset=0", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=120, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        rows = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", result.stderr)
+        if rows:
+            found.append(tuple(map(int, rows[-1])))
+    if len(found) < 2:
+        return None
+    # The bars must be consistent; a dark scene alone is not a letterbox.
+    visible = max(row[1] for row in found)
+    top = min(row[3] for row in found)
+    if visible >= height * 0.92 or visible < height * 0.5:
+        return None
+    crop_width = min(width, int(visible * 16 / 9) // 2 * 2)
+    left = (width - crop_width) // 2 // 2 * 2
+    return f"crop={crop_width}:{visible}:{left}:{top},scale={width}:{height}:flags=lanczos,setsar=1"
+
+
+def _remove_letterbox(asset: dict, warnings: list[str]) -> None:
+    """Re-encode a letterboxed clip so the picture fills the 16:9 frame. Timing is unchanged."""
+    path = Path(asset["path"])
+    if asset.get("letterbox_removed"):
+        return
+    crop = _letterbox_crop(path)
+    if not crop:
+        return
+    target = path.with_name(path.stem + "-filled.mp4")
+    try:
+        from movie_pipeline.core import ffmpeg
+        ffmpeg("-i", path, "-vf", crop, "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+               "-c:a", "copy", "-movflags", "+faststart", target)
+        target.replace(path)
+        asset["letterbox_removed"] = True
+        asset.update(_video_info(path))
+    except (OSError, PipelineError):
+        target.unlink(missing_ok=True)
+        warnings.append(f"Letterbox removal was skipped for {path.name}.")
+
+
+def _log_clips(assets: list[dict], show: dict, season: dict, root: Path, client, warnings: list[str]) -> None:
+    """Gemini watches each clip and logs clean scenes; skipped silently without a key."""
+    from .gemini_media import analyse_clip
+    titles = [str(e.get("title") or "") for e in season.get("episodes") or []]
+    logged = 0
+    for asset in assets:
+        if asset.get("kind") != "video":
+            continue
+        _remove_letterbox(asset, warnings)
+        result = analyse_clip(client, Path(asset["path"]), float(asset.get("duration") or 0), show,
+                              int(season["number"]), titles, root / "gemini")
+        if result and result.get("scenes"):
+            asset["shots"] = result["scenes"]
+            asset["thumbnail_times"] = result.get("thumbnail_times", [])
+            logged += 1
+    if client is not None and assets:
+        warnings.append(f"Season {season['number']}: Gemini logged scenes in {logged} of "
+                        f"{sum(a.get('kind') == 'video' for a in assets)} clips.")
+
+
 def collect_assets(bundle: dict, spec, cache_dir: Path) -> dict:
     """Return local video/image paths shared by season and series recaps.
 
     Every returned season precedes spec.upcoming_season. Generic show posters
-    without prior-season provenance never enter the visual pool.
+    without prior-season provenance never enter the visual pool. A season may
+    come back empty; the renderer then borrows footage from another covered
+    season rather than showing a blank plate.
     """
+    from .gemini import shared_client
     show = bundle.get("show") or {}
     incoming = int(spec.upcoming_season)
     if (not show.get("id") or not show.get("title")
@@ -578,17 +707,20 @@ def collect_assets(bundle: dict, spec, cache_dir: Path) -> dict:
     result = {"seasons": {}, "sources": [], "warnings": []}
     budget = _Budget()
     image_limit = _image_limit()
-    for season in sorted(bundle.get("seasons") or [], key=lambda row: int(row["number"])):
+    client = shared_client()
+    prior = [row for row in bundle.get("seasons") or [] if 0 < int(row["number"]) < incoming]
+    windows = season_windows(prior)
+    for season in sorted(prior, key=lambda row: int(row["number"])):
         number = int(season["number"])
-        if not 0 < number < incoming:
-            continue
         season_root = root / f"season-{number:02}"
         season_root.mkdir(parents=True, exist_ok=True)
         manifest = season_root / "assets.json"
-        cached = _cached(manifest, show, season, incoming)
+        window = windows.get(number)
+        cached = _cached(manifest, show, season, incoming, window)
         if cached is None:
             assets = _discover_videos(show, season, incoming, season_root,
-                                      2160 if spec.try_4k else 1080, budget, result["warnings"])
+                                      2160 if spec.try_4k else 1080, budget, result["warnings"],
+                                      client, window)
             if not assets:
                 assets = _fallback_images(show, season, season_root, budget, result["warnings"],
                                           limit=image_limit)
@@ -607,6 +739,7 @@ def collect_assets(bundle: dict, spec, cache_dir: Path) -> dict:
         else:
             assets = _fallback_images(show, season, season_root, budget, result["warnings"],
                                       cached=cached, limit=image_limit)
+        _log_clips(assets, show, season, season_root, client, result["warnings"])
         payload = {"version": CACHE_VERSION, "image_limit": image_limit,
                    "fingerprint": _fingerprint(show, season), "assets": assets}
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", dir=season_root, delete=False) as temporary:
@@ -618,4 +751,7 @@ def collect_assets(bundle: dict, spec, cache_dir: Path) -> dict:
                                  for asset in assets if asset.get("source_url"))
     if not result["seasons"]:
         raise PipelineError("No researched prior seasons are available for recap visuals.")
+    if not any(result["seasons"].values()):
+        raise PipelineError("No footage or imagery could be downloaded for any covered season. "
+                            "Add or refresh the YOUTUBE_COOKIES secret and run again; no blank-plate video is made.")
     return result

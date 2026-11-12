@@ -105,22 +105,27 @@ def _source_images(script: dict, bundle: dict, assets: dict, work: Path) -> tupl
             tried += 1
             try:
                 if asset["kind"] == "image":
-                    images = [(_read_image(path), None)]
+                    images = [(_read_image(path), None, False)]
                 else:
                     length = float(asset.get("duration") or 0)
                     if not math.isfinite(length) or length <= 0:
                         continue
                     images = []
-                    for offset, fraction in enumerate((0.28, 0.62)):
+                    # Gemini's picked moments (sharp, expressive, no text or logo) come first.
+                    picked = [float(t) for t in asset.get("thumbnail_times") or []
+                              if isinstance(t, (int, float)) and 0 <= t < length][:2]
+                    moments = picked or [length * fraction for fraction in (0.28, 0.62)]
+                    for offset, second in enumerate(moments):
                         frame = work / f"source-{tried:02}-{offset}.jpg"
                         try:
-                            ffmpeg("-ss", f"{max(0, min(length - 0.05, length * fraction)):.3f}",
+                            ffmpeg("-ss", f"{max(0, min(length - 0.05, second)):.3f}",
                                    "-i", path, "-frames:v", "1", "-vf", "scale=1280:-2", frame)
-                            images.append((_read_image(frame), round(length * fraction, 3)))
+                            images.append((_read_image(frame), round(second, 3), bool(picked)))
                         except (OSError, ValueError, PipelineError):
                             continue
-                for image, second in images:
+                for image, second, chosen in images:
                     result.append((image, {
+                        "gemini_pick": chosen,
                         "path": str(path), "source_url": str(asset.get("source_url") or ""),
                         "source_title": str(asset.get("title") or ""), "season": season,
                         "episode_ids": ids, "illustrative": bool(asset.get("illustrative")),
@@ -129,8 +134,9 @@ def _source_images(script: dict, bundle: dict, assets: dict, work: Path) -> tupl
                     }))
             except (OSError, ValueError, PipelineError):
                 warnings.append(f"Could not read a verified thumbnail source for season {season}.")
-    # A true episode image/frame takes priority over an illustrative show poster.
-    result.sort(key=lambda row: row[1]["illustrative"])
+    # A true episode image/frame takes priority over an illustrative show poster,
+    # and Gemini-picked moments over fixed positions in a clip.
+    result.sort(key=lambda row: (row[1]["illustrative"], not row[1].get("gemini_pick")))
     if any(not row[1]["illustrative"] for row in result):
         result = [row for row in result if not row[1]["illustrative"]]
     return result, warnings
@@ -187,7 +193,12 @@ def _canvas(image: Image.Image, variant: int) -> Image.Image:
         background.paste(subject, (SIZE[0] - subject.width - 42, (SIZE[1] - subject.height) // 2))
     else:
         background = ImageOps.fit(image, SIZE, method=Image.Resampling.LANCZOS, centering=(0.58, 0.42))
-        background = ImageEnhance.Contrast(background).enhance(1.05)
+        # Dark trailer frames read as murky at thumbnail size: lift them before the shade.
+        light = ImageStat.Stat(background.convert("L")).mean[0]
+        if light < 95:
+            background = ImageEnhance.Brightness(background).enhance(min(1.6, 95 / max(light, 30)))
+        background = ImageEnhance.Contrast(background).enhance(1.15)
+        background = ImageEnhance.Color(background).enhance(1.12)
     canvas = background.convert("RGBA")
     shade = Image.new("RGBA", SIZE)
     draw = ImageDraw.Draw(shade)
@@ -219,6 +230,10 @@ def build_thumbnails(script: dict, bundle: dict, assets: dict, output: Path) -> 
             raise PipelineError("No readable, verified image or video frame exists within this recap's season scope; thumbnails cannot invent the show's identity.")
         coverage = f"Season {seasons[0]} Recap" if len(seasons) == 1 else f"Seasons {seasons[0]}-{seasons[-1]} Recap"
         before = f"Before Season {upcoming}"
+        concepts = script.get("thumbnail_concepts") or [{}]
+        hook = str(concepts[0].get("headline") or "") if isinstance(concepts[0], dict) else ""
+        if hook.upper() in {"WHERE WE LEFT OFF", "THE STORY SO FAR", ""}:
+            hook = ""
         results, report = [], []
         for variant in range(3):
             image, provenance = candidates[variant % len(candidates)]
@@ -236,6 +251,12 @@ def build_thumbnails(script: dict, bundle: dict, assets: dict, output: Path) -> 
                 y = _text(draw, before, (58, 458), 1040, maximum=67, lines=1, fill=accent)
                 _text(draw, coverage, (61, min(610, y + 15)), 1040, maximum=35, lines=1)
                 headline, subline = before, coverage
+            elif hook:
+                # Gemini's story headline leads; the show and scope stay readable below it.
+                y = _text(draw, hook.upper(), (58, 90), 760, maximum=84, lines=2, fill=accent)
+                y = _text(draw, title.upper(), (58, max(300, y + 20)), 900, maximum=52, lines=2)
+                _text(draw, f"{coverage} · {before}", (61, min(600, y + 14)), 1000, maximum=34, lines=1)
+                headline, subline = hook.upper(), f"{coverage} · {before}"
             else:
                 y = _text(draw, title.upper(), (58, 96), 700, maximum=77, lines=2)
                 y = _text(draw, coverage, (58, max(320, y + 20)), 900, maximum=65, lines=1, fill=accent)

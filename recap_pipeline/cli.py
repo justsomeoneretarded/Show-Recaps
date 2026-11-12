@@ -82,7 +82,8 @@ def research_stage(shared):
 
 
 def write_stage(shared):
-    from .writing import RecapWriter, build_ledger, write_recap
+    from .gemini import shared_client
+    from .writing import RecapWriter, apply_packaging, build_ledger, write_recap
 
     shared = Path(shared)
     spec = load_spec(shared)
@@ -96,6 +97,7 @@ def write_stage(shared):
         scripts = {}
         for kind in kinds_for(spec):
             script = write_recap(kind, spec, bundle, ledger, cache, writer)
+            script = apply_packaging(script, shared_client())
             draft = shared / f"{kind}-draft.json"
             save_json(draft, script)
             validate_script_scope(script, spec, bundle)

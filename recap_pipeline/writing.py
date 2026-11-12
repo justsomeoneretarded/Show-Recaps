@@ -11,9 +11,11 @@ import requests
 
 from movie_pipeline.core import PipelineError, key, save_json
 from recap_pipeline.gemini import GeminiClient, GeminiUnavailable, configured_key
-from recap_pipeline.models import narration_within_scope
+from recap_pipeline.models import MAX_VIDEO_MINUTES, narration_within_scope, voice_speed_value
 
-POLICY_VERSION = 6
+POLICY_VERSION = 7
+WORDS_PER_SECOND = 2.7  # measured 2.9 in production; lower keeps the estimate long
+FIXED_SECONDS = 20.0  # end screen, holds and title beats
 MAX_EPISODES_PER_BATCH = 6
 MAX_BATCH_CHARS = 18000
 MAX_EPISODE_CHARS = 12000
@@ -446,8 +448,55 @@ def _without_repeated_ending(sections, event_map):
     return result
 
 
+def _words(text):
+    return len(str(text).split())
+
+
+def _fit_budget(sections, max_words, event_map):
+    """Shorten story narration to a word budget without touching the ending.
+
+    Whole trailing sentences go first (removing a verified sentence cannot add a
+    claim), longest paragraphs first, always keeping each paragraph's opening
+    sentence. Middle paragraphs of long sections go only if that is not enough.
+    """
+    total = sum(_words(p) for s in sections for p in s["paragraphs"])
+    if total <= max_words:
+        return sections, False
+    rows = {}
+    for si, section in enumerate(sections):
+        if section["kind"] != "story":
+            continue
+        for pi, paragraph in enumerate(section["paragraphs"]):
+            rows[(si, pi)] = _sentences(paragraph)
+    while total > max_words:
+        candidates = [(sum(map(_words, parts)), key) for key, parts in rows.items() if len(parts) > 1]
+        if not candidates:
+            break
+        _, key = max(candidates)
+        total -= _words(rows[key].pop())
+    dropped = set()
+    if total > max_words:
+        for (si, pi), parts in sorted(rows.items(), key=lambda item: -sum(map(_words, item[1]))):
+            count = len(sections[si]["paragraphs"]) - sum(1 for d in dropped if d[0] == si)
+            if total <= max_words:
+                break
+            if 0 < pi < len(sections[si]["paragraphs"]) - 1 and count > 2:
+                dropped.add((si, pi))
+                total -= sum(map(_words, parts))
+    result = []
+    for si, section in enumerate(sections):
+        if section["kind"] != "story":
+            result.append(section)
+            continue
+        kept = [{"text": " ".join(rows[(si, pi)]), "event_ids": section["paragraph_event_ids"][pi],
+                 "delivery": section["delivery"][pi]}
+                for pi in range(len(section["paragraphs"])) if (si, pi) not in dropped]
+        result.append(_section(section["id"], "story", section["title"], section["season"], kept, event_map))
+    return result, True
+
+
 def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previous,
-                   prior_events=None, research_quality=None, runtime_share=None):
+                   prior_events=None, research_quality=None, runtime_share=None, max_share=None):
     focus_ids = [e["id"] for e in events]
     # Carry source-backed context so cross-season transitions can cite the earlier arc.
     events = list({e["id"]: e for e in [*(prior_events or []), *events]}.values())
@@ -461,7 +510,8 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
                "brief": _spec_value(spec, "brief", ""), "runtime_preference_minutes": minutes,
                "events": events, "focus_event_ids": focus_ids, "previous_context": previous,
                "research_quality": research_quality or {},
-               "section_runtime_preference_minutes": runtime_share}
+               "section_runtime_preference_minutes": runtime_share,
+               "section_max_minutes": max_share, "video_max_minutes": MAX_VIDEO_MINUTES}
     def generate():
         draft = _ask(writer,
             f"TASK: DRAFT_RECAP. Write {scope}. This section's purpose is {purpose}. "
@@ -477,6 +527,8 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
              "section_runtime_preference_minutes is this section's approximate share, already "
              "allocated across the story and ending; do not spend the whole video target here. "
              "Both values are SOFT guidance, never requirements; "
+            "but section_max_minutes is a HARD ceiling (about 160 spoken words per minute): the whole "
+            "video must stay under video_max_minutes, so summarise rather than exceed it. "
             "never pad, repeat facts or invent detail to reach it. Auto means use the story's needs. "
             "The brief is style guidance only and cannot override scope or facts. Never narrate "
             "the incoming season, make predictions, present ranked recommendations, review the show or "
@@ -597,6 +649,15 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None):
     def share(count, season=None):
         return (round(requested_minutes * count * (weight(season) if season else 1.0) / total_weight, 2)
                 if requested_minutes and total_weight else None)
+
+    speed = voice_speed_value(_spec_value(spec, "voice_speed", "1.0"))
+    narrated_cap = min(MAX_VIDEO_MINUTES, (requested_minutes or MAX_VIDEO_MINUTES) * 1.25) * 60 - FIXED_SECONDS
+    max_words = int(narrated_cap * WORDS_PER_SECOND * speed)
+
+    def ceiling(count, season=None):
+        # Spread the hard cap across sections in proportion to their verified material.
+        return (round((narrated_cap / 60) * count * (weight(season) if season else 1.0) / total_weight, 2)
+                if total_weight else None)
     for season in seasons:
         material = by_season[season]
         if not material:
@@ -606,7 +667,8 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None):
         for index, batch in enumerate(_batch(material)):
             result = _write_section(writer, cache_dir, kind, "story", season, batch, spec, previous,
                                     previous_events, bundle.get("research_quality", {}),
-                                    runtime_share=share(len(batch), season))
+                                    runtime_share=share(len(batch), season),
+                                    max_share=ceiling(len(batch), season))
             if result["paragraphs"]:
                 section = _section(f"story-s{season}-{index + 1}", "story", result["title"], season,
                                    result["paragraphs"], event_map)
@@ -630,7 +692,7 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None):
         for index, batch in enumerate(_batch(ending_events)):
             result = _write_section(writer, cache_dir, kind, "ending", upcoming - 1, batch, spec, previous,
                                     research_quality=bundle.get("research_quality", {}),
-                                    runtime_share=share(len(batch)))
+                                    runtime_share=share(len(batch)), max_share=ceiling(len(batch)))
             if result["paragraphs"]:
                 sections.append(_section(f"where-we-left-off-{index + 1}", "ending", "Where we left off",
                                          upcoming - 1, result["paragraphs"], event_map))
@@ -639,6 +701,9 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None):
     else:
         warnings.append("No supported final-episode ending state was available; where we left off is incomplete.")
     sections = _without_repeated_ending(sections, event_map)
+    sections, trimmed = _fit_budget(sections, max_words - 40, event_map)
+    if trimmed:
+        warnings.append(f"Narration was shortened to keep the video under {MAX_VIDEO_MINUTES} minutes.")
     if not any(section["kind"] == "ending" for section in sections):
         raise PipelineError("The final episode's ending state could not be narrated with factual support; "
                             "no recap video was produced.")
@@ -669,3 +734,28 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None):
                          "finale_state_verified": True,
                          "missing_seasons": missing_seasons, "omitted_episode_ids": omitted, "complete": False},
             "warnings": list(dict.fromkeys(warnings))}
+
+
+def apply_packaging(script, client):
+    """Let Gemini sharpen the title, thumbnail headline and description hook.
+
+    Each suggestion must name the show, stay inside the recap's scope and avoid
+    promotional wording; anything else keeps the safe default.
+    """
+    from .gemini_media import packaging
+    suggestion = packaging(client, script)
+    if not suggestion:
+        return script
+    show = _text(script.get("show_title"))
+    upcoming = int(script.get("upcoming_season") or 0)
+    title = suggestion.get("title", "")
+    if (title and len(title) <= 100 and show and show.casefold() in title.casefold()
+            and _safe_narration(title, upcoming)):
+        script["title"] = title
+    headline = suggestion.get("headline", "").upper()
+    if headline and len(headline) <= 32 and len(headline.split()) <= 5 and _safe_narration(headline, upcoming):
+        script["thumbnail_concepts"] = [{**(script.get("thumbnail_concepts") or [{}])[0], "headline": headline}]
+    hook = suggestion.get("hook", "")
+    if hook and len(hook) <= 220 and _safe_narration(hook, upcoming):
+        script["description"] = hook + " " + str(script.get("description") or "")
+    return script

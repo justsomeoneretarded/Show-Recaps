@@ -23,8 +23,11 @@ from movie_pipeline.speech_recovery import SpeechRecovery
 from movie_pipeline.subtitles import script_cues
 from movie_pipeline.timing import DurationSpec
 
-from .editing import (UsageTracker, analyse_assets, choose_resolution, ensure_neutral_plate,
-                      plan_source_audio, plan_visuals)
+from .editing import (UsageTracker, analyse_assets, choose_resolution, plan_source_audio,
+                      plan_visuals, scene_catalogue)
+from .gemini import shared_client
+from .gemini_media import rank_scenes
+from .models import voice_speed_value
 from .models import validate_script_scope
 from .thumbnails import build_thumbnails
 
@@ -83,19 +86,24 @@ def _part_seconds(path):
     return max(ends)
 
 
-def _chapter_title(section):
+def _chapter_title(section, show_title=""):
     title = " ".join(str(section.get("title") or "The story").split())
+    show = " ".join(str(show_title or "").split())
+    # "The Terminal List: A Mission of Revenge" reads as "A Mission of Revenge" in a chapter.
+    if show and title.casefold().startswith(show.casefold()):
+        rest = title[len(show):].lstrip(" :–-—")
+        title = rest or title
     season = section.get("season")
     if season is not None and not title.casefold().startswith(f"season {season}".casefold()):
         return f"Season {season}: {title}"
     return title
 
 
-def _label(path, section):
+def _label(path, section, show_title=""):
     """Season/chapter lower third, sharing the existing restrained animation."""
     image = Image.new("RGBA", (1280, 720), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    title = _chapter_title(section)
+    title = _chapter_title(section, show_title)
     face = render.brand_font("body-medium", 34)
     lines = render.wrapped(draw, title, face, 1090)
     while len(lines) > 2 and face.size > 20:
@@ -177,20 +185,21 @@ def _validate_timeline(timeline, script, spec, bundle):
         if section is None:
             raise PipelineError("A rendered event does not belong to a verified recap section.")
         for shot in event.get("shots", []):
-            neutral = shot.get("scope") == "neutral-title-card"
             season = shot.get("season")
-            if season is None:
-                if not neutral:
-                    raise PipelineError("Unscoped recap footage was selected.")
-            elif season not in allowed or season != section.get("season"):
-                raise PipelineError("Recap footage escaped its current section's season.")
-            if section.get("season") is None and not neutral:
-                raise PipelineError("Recap orientation sections require neutral illustrative visuals.")
             ids = shot.get("episode_ids") or ([shot["episode_id"]] if shot.get("episode_id") else [])
+            if season is None:
+                raise PipelineError("Unscoped recap footage was selected.")
+            if season not in allowed:
+                raise PipelineError("Recap footage escaped its current section's season.")
+            orientation = section.get("season") is None
+            if not orientation and season != section.get("season") and (
+                    shot.get("selection") != "other-season-fallback" or ids):
+                raise PipelineError("Recap footage escaped its current section's season.")
             if any(episodes.get(str(value)) != season for value in ids):
                 raise PipelineError("Selected footage has an unknown or wrong-season episode.")
             current = set(event.get("episode_ids") or [])
-            if ids and (not current or not set(map(str, ids)).issubset(current)):
+            # Intro/outro footage illustrates the show, not a paragraph's episode.
+            if ids and not orientation and (not current or not set(map(str, ids)).issubset(current)):
                 raise PipelineError("Selected footage does not belong to the current paragraph episode.")
             if event["type"] == "trailer-audio" and (len(current) != 1 or set(map(str, ids)) != current):
                 raise PipelineError("Native source audio requires one known current episode.")
@@ -279,6 +288,9 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
             usage = UsageTracker(int(_value(spec, "upcoming_season")), allowed_seasons=set(allowed),
                                  episode_seasons=episodes)
             analyses = analyse_assets(scoped_assets, work / "source-analysis", usage)
+            gemini = shared_client()
+            voice_speed = voice_speed_value(_value(spec, "voice_speed", "1.0"))
+            report["voice_speed"] = voice_speed
             if analyses:
                 scoped_assets = {**scoped_assets, "_analyses": analyses}
             parts, timeline, cues, chapters, clock = [], [], [], [], 0.0
@@ -286,11 +298,12 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
                 paragraphs = section.get("paragraphs") or []
                 if not paragraphs:
                     continue
-                chapters.append({"start": clock, "title": _chapter_title(section), "section_id": section["id"]})
+                show_title = script.get("show_title") or _value(spec, "show_title")
+                chapters.append({"start": clock, "title": _chapter_title(section, show_title),
+                                 "section_id": section["id"]})
                 label = work / f"chapter-{section_index:03}.png"
-                _label(label, section)
-                neutral = ensure_neutral_plate(work / "neutral", script.get("show_title") or _value(spec, "show_title"), section.get("season"))
-                pool = {**scoped_assets, "_neutral": neutral}
+                _label(label, section, show_title)
+                pool = scoped_assets
                 native_inserted = False
                 for paragraph_index, text in enumerate(paragraphs):
                     if not isinstance(text, str) or not text.strip():
@@ -305,6 +318,8 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
                     raw_seconds = duration(audio)
                     pace = delivery_speed(narration_rate(theme), delivery,
                                           words=len(text.split()), seconds=raw_seconds)
+                    # The viewer-chosen voice-over speed multiplies the natural delivery pace.
+                    pace = round(min(1.6, max(0.75, pace * voice_speed)), 3)
                     audio = voice.paced_take(Path(audio), pace)
                     aligned = [{**cue, "start": cue["start"] / pace, "end": cue["end"] / pace} for cue in aligned]
                     # Save a unique complete verified recording for the final review.
@@ -313,8 +328,11 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
                     if Path(audio).resolve() != retained.resolve():
                         shutil.copyfile(audio, retained)
                     current_episodes = _paragraph_episodes(section, paragraph_index, episodes)
+                    preferred = rank_scenes(gemini, text, scene_catalogue(
+                        section, text, pool, usage, episode_ids=current_episodes),
+                        context=f"{show_title}: {_chapter_title(section, show_title)}")
                     chosen = plan_visuals(section, text, duration(retained), pool, usage,
-                                          episode_ids=current_episodes)
+                                          episode_ids=current_episodes, preferred=preferred)
                     if not chosen:
                         raise PipelineError("No scoped visual plan covers the complete recap paragraph.")
                     part_work = work / "parts" / f"{section_index:03}-{paragraph_index:03}"

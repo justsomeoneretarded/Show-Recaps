@@ -15,14 +15,28 @@ def _integer(value, low, high, label):
     return value
 
 
+MAX_VIDEO_MINUTES = 20
+VOICE_SPEEDS = ("0.9", "1.0", "1.1", "1.15", "1.2", "1.25", "1.3")
+
+
 def _minutes(value, label):
     if value == "Auto":
         return value
     if type(value) is int:
         value = str(value)
-    if not isinstance(value, str) or not re.fullmatch(r"(?:[1-9]|[12][0-9]|30)", value):
-        raise PipelineError(f"{label} must be Auto or a whole number from 1 to 30.")
+    if not isinstance(value, str) or not re.fullmatch(r"(?:[1-9]|1[0-9]|20)", value):
+        raise PipelineError(f"{label} must be Auto or a whole number from 1 to {MAX_VIDEO_MINUTES}.")
     return value
+
+
+def voice_speed_value(value) -> float:
+    """The selected voice-over speed as a multiplier (1.0 is the natural reading)."""
+    text = str(value).strip()
+    if text in ("1", "1.00"):
+        text = "1.0"
+    if text not in VOICE_SPEEDS:
+        raise PipelineError("Voice speed must be one of " + ", ".join(VOICE_SPEEDS) + ".")
+    return float(text)
 
 
 @dataclass(frozen=True)
@@ -36,6 +50,7 @@ class RecapSpec:
     season_minutes: str = "Auto"
     series_minutes: str = "Auto"
     try_4k: bool = True
+    voice_speed: str = "1.0"
 
     def __post_init__(self):
         if (not isinstance(self.show_title, str) or not self.show_title.strip()
@@ -54,6 +69,9 @@ class RecapSpec:
             object.__setattr__(self, field, _minutes(getattr(self, field), field.replace("_", " ").title()))
         if type(self.try_4k) is not bool:
             raise PipelineError("Try 4K must be a boolean.")
+        voice_speed_value(self.voice_speed)
+        object.__setattr__(self, "voice_speed", "1.0" if str(self.voice_speed).strip() in ("1", "1.00")
+                           else str(self.voice_speed).strip())
 
     @classmethod
     def from_env(cls, env=None):
@@ -75,6 +93,7 @@ class RecapSpec:
             tts_model=env.get("TTS_MODEL", "original"),
             season_minutes=env.get("SEASON_MINUTES", "Auto"),
             series_minutes=env.get("SERIES_MINUTES", "Auto"), try_4k=four_k == "true",
+            voice_speed=env.get("VOICE_SPEED", "1.0").strip() or "1.0",
         )
 
     @classmethod

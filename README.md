@@ -11,7 +11,7 @@ For incoming Season 4, these cover Season 3 and Seasons 1–3. For incoming Seas
 
 Open **Actions → Generate Show Recaps → Run workflow**, using branch **main**.
 
-Supply the full show title, original premiere year, and incoming season number. Add an optional creative brief. Choose Warguy (default), Kit Laser or Female; original Chatterbox is the default speech model. Each recap has its own Auto/minutes control and the shared Try 4K checkbox defaults on.
+Supply the full show title, original premiere year, and incoming season number. Add an optional creative brief. Choose Warguy (default), Kit Laser or Female; original Chatterbox is the default speech model. Each recap has its own Auto/minutes control (1–20; no video is ever planned longer than 20 minutes, even for many seasons), the shared Try 4K checkbox defaults on, and **Voice-over speed** (0.9–1.3, default 1.0) speeds up or slows down the narration.
 
 The workflow researches once, writes two scripts from a shared story ledger, collects prior-season assets, then renders the two packages independently. Runtime targets allow ±25% and remain guidance; useful narration is not padded or cut through words to meet a stopwatch.
 
@@ -30,7 +30,7 @@ Recap writing is separate from the countdown writer: it explains actions, motiva
 
 **Required ending information is a quality safeguard.** A teaser summary is not enough to invent how a finale ended. If the pipeline cannot establish a supported ending or meaningful story for the selected scope, it stops with a research/writing diagnostic instead of delivering an intro-only or fabricated recap. Available summaries do not certify exhaustive plot coverage; no automatic system guarantees flawless factual interpretation.
 
-Footage discovery rejects incoming/wrong-season material, reactions, concept videos and full episodes. It uses genuine clips where season identity can be established, then verified prior-episode stills. If usable imagery is unavailable, an explicitly reported neutral title plate provides an illustrative fallback. The current pipeline cannot obtain arbitrary full episodes from streaming services, and clip availability determines how closely visuals can illustrate every event.
+Footage discovery searches widely (trailers, official clips, sneak peeks, teasers, scenes and episode titles, plus Gemini-suggested searches) and downloads up to 14 clips per season (repository variable **RECAP_MAX_CLIPS_PER_SEASON**, up to 30). It rejects incoming/wrong-season material, reactions, concept videos and full episodes; a clip that names no season is accepted only when it was uploaded during that season's airing window. Letterbox bars are removed. Gemini watches every clip, logs each scene (who, what, where, picture quality, logos, on-screen text) and, at render time, picks the scenes that best match each narrated paragraph. Footage is never replaced by a blank title plate: when fresh footage runs out the least-used shots are reused, then footage from another covered season; if nothing at all can be downloaded the run stops with a clear message. The current pipeline cannot obtain arbitrary full episodes from streaming services, and clip availability determines how closely visuals can illustrate every event.
 
 ## Voice and sound
 
@@ -42,7 +42,7 @@ Narration sits over a quiet, consistent licensed instrumental bed. Optional nati
 
 No paid inference API is required. Configure these under this repository's **Settings → Secrets and variables → Actions** when desired:
 
-- **GEMINI_API_KEY:** optional free Google AI Studio key. When set, Gemini writes, fact-checks and edits the scripts (much faster and more natural than the local model). The **Script AI** input chooses `auto` (Gemini, switching to the local model for the rest of the run if the free quota or service fails), `gemini` (Gemini only) or `local`. Set the repository *variable* **GEMINI_MODEL** to change the model (default `gemini-3-flash-preview`). Free-tier requests may be used by Google to improve its products; only public plot summaries are sent. Every Gemini claim still has to match a verbatim source quote.
+- **GEMINI_API_KEY:** optional free Google AI Studio key. When set, Gemini writes, fact-checks and edits the scripts (much faster and more natural than the local model). The repository *variable* **RECAP_WRITER** chooses `auto` (default) (Gemini, switching to the local model for the rest of the run if the free quota or service fails), `gemini` (Gemini only) or `local`. Gemini also suggests clip searches, logs and ranks footage, chooses thumbnail moments and writes the title, thumbnail headline and description hook. Set the repository *variable* **GEMINI_MODEL** to change the model (default `gemini-3-flash-preview`). Free-tier requests may be used by Google to improve its products; only public plot summaries are sent. Every Gemini claim still has to match a verbatim source quote.
 - **YOUTUBE_COOKIES:** optional downloader authentication. These are private and excluded from packages.
 - **TMDB_READ_TOKEN:** optional supplementary metadata/episode lookup.
 - **TELEGRAM_BOT_TOKEN** and **TELEGRAM_CHAT_ID:** optional completion reminder after both packages were uploaded. Channel pinning also needs the bot's appropriate channel rights.

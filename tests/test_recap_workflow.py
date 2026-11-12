@@ -10,7 +10,9 @@ def test_recap_workflow_two_outputs_share_one_frozen_prepare():
     assert inputs["tts_model"]["default"]=="original"
     assert inputs["narrator"]["default"]=="Warguy"
     assert inputs["try_4k"]["default"]=="true"
-    assert inputs["season_minutes"]["options"]==["Auto",*map(str,range(1,31))]
+    assert inputs["season_minutes"]["options"]==["Auto",*map(str,range(1,21))]
+    assert inputs["voice_speed"]["default"]=="1.0" and "1.2" in inputs["voice_speed"]["options"]
+    assert "GEMINI_API_KEY" in data["jobs"]["render"]["env"]
     assert inputs["series_minutes"]["options"]==inputs["season_minutes"]["options"]
     assert data["jobs"]["render"]["needs"]=="prepare"
     kinds=data["jobs"]["render"]["strategy"]["matrix"]["kind"]

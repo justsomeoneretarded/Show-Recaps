@@ -48,7 +48,8 @@ def test_defaults_are_immutable_and_serialization_contains_only_request():
         spec.tts_model = "turbo"
     assert RecapSpec.from_dict(spec.to_dict()) == spec
     assert set(spec.to_dict()) == {"show_title", "premiere_year", "upcoming_season", "brief",
-                                  "narrator", "tts_model", "season_minutes", "series_minutes", "try_4k"}
+                                  "narrator", "tts_model", "season_minutes", "series_minutes", "try_4k",
+                                      "voice_speed"}
     assert recap_seasons("season", spec) == [2]
     assert recap_seasons("series", spec) == [1, 2]
 
@@ -79,9 +80,32 @@ def test_invalid_requests_fail(field, value):
         request(**{field: value})
 
 
-@pytest.mark.parametrize("value", ["Auto", *map(str, range(1, 31)), *range(1, 31)])
+@pytest.mark.parametrize("value", ["Auto", *map(str, range(1, 21)), *range(1, 21)])
 def test_whole_runtime_preferences_are_soft_and_normalized(value):
     assert request(season_minutes=value).season_minutes == str(value)
+
+
+@pytest.mark.parametrize("value", ["21", 25, "30", "0"])
+def test_no_video_may_be_requested_longer_than_twenty_minutes(value):
+    with pytest.raises(PipelineError, match="1 to 20"):
+        request(series_minutes=value)
+
+
+@pytest.mark.parametrize("value", ["0.9", "1.0", "1", "1.15", "1.3"])
+def test_voice_speed_choices_are_accepted(value):
+    assert request(voice_speed=value).voice_speed == ("1.0" if value == "1" else value)
+
+
+@pytest.mark.parametrize("value", ["2", "0.5", "fast", ""])
+def test_unknown_voice_speed_is_rejected(value):
+    with pytest.raises(PipelineError, match="Voice speed"):
+        request(voice_speed=value)
+
+
+def test_voice_speed_is_read_from_the_environment():
+    env = {"SHOW_TITLE": "Example", "SHOW_YEAR": "2020", "UPCOMING_SEASON": "3", "VOICE_SPEED": "1.2"}
+    assert RecapSpec.from_env(env).voice_speed == "1.2"
+    assert RecapSpec.from_env({**env, "VOICE_SPEED": ""}).voice_speed == "1.0"
 
 
 @pytest.mark.parametrize("env", [

@@ -15,6 +15,8 @@ import requests
 from movie_pipeline.core import PipelineError
 
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models"
+FILES_ROOT = "https://generativelanguage.googleapis.com/v1beta/files"
+UPLOAD_ROOT = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 DEFAULT_MODEL = "gemini-3-flash-preview"
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 6
@@ -74,18 +76,28 @@ class GeminiClient:
         self.sleep = sleep
         self.min_interval = float(os.getenv("GEMINI_MIN_INTERVAL", "0") or 0)
         self._last = 0.0
+        # After one exhausted retry cycle (daily quota, outage) stop asking for the rest of the
+        # run, so optional calls cannot add hours of backoff.
+        self.unavailable = False
 
-    def generate_json(self, system, prompt, schema, *, temperature=None, max_tokens=32768):
+    def generate_json(self, system, prompt, schema, *, temperature=None, max_tokens=32768,
+                      media=None, media_resolution=None):
+        """Structured JSON answer. ``media`` holds extra request parts such as
+        ``{"fileData": {...}}`` or ``{"inlineData": {...}}`` placed before the prompt."""
         if not self.key:
             raise PipelineError("GEMINI_API_KEY is not configured.")
+        if self.unavailable:
+            raise GeminiUnavailable("Gemini was unavailable earlier in this run.")
         config = {"responseMimeType": "application/json", "responseJsonSchema": schema,
                   "maxOutputTokens": max_tokens}
+        if media_resolution:
+            config["mediaResolution"] = media_resolution
         # Gemini 3 models are tuned for their default temperature; lowering it
         # can cause looping, so only older models receive the requested value.
         if temperature is not None and not self.model.startswith("gemini-3"):
             config["temperature"] = temperature
         body = {"systemInstruction": {"parts": [{"text": system}]},
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "contents": [{"role": "user", "parts": [*(media or []), {"text": prompt}]}],
                 "generationConfig": config, "safetySettings": SAFETY}
         url = f"{API_ROOT}/{self.model}:generateContent"
         last_problem = "no attempt was made"
@@ -117,4 +129,60 @@ class GeminiClient:
                     last_problem = f"HTTP {response.status_code}"
             if attempt + 1 < MAX_ATTEMPTS:
                 self.sleep(_retry_delay(response, attempt))
+        self.unavailable = True
         raise GeminiUnavailable(f"Gemini was unavailable after {MAX_ATTEMPTS} attempts: {last_problem}.")
+
+    def upload_file(self, path, mime_type, *, display_name="recap-source", wait_seconds=300):
+        """Upload a local file with the resumable File API and wait until it can be used.
+
+        Returns the file resource (``name``, ``uri``, ``mimeType``). Upload and
+        processing problems raise GeminiUnavailable so callers can skip the file.
+        """
+        from pathlib import Path
+        if not self.key:
+            raise PipelineError("GEMINI_API_KEY is not configured.")
+        data = Path(path).read_bytes()
+        headers = {"x-goog-api-key": self.key, "X-Goog-Upload-Protocol": "resumable",
+                   "X-Goog-Upload-Command": "start", "X-Goog-Upload-Header-Content-Length": str(len(data)),
+                   "X-Goog-Upload-Header-Content-Type": mime_type, "Content-Type": "application/json"}
+        try:
+            start = self.session.post(UPLOAD_ROOT, headers=headers, timeout=60,
+                                      json={"file": {"display_name": display_name}})
+            upload_url = start.headers.get("X-Goog-Upload-URL") or start.headers.get("x-goog-upload-url")
+            if start.status_code >= 400 or not upload_url:
+                raise GeminiUnavailable(f"Gemini file upload could not start (HTTP {start.status_code}).")
+            done = self.session.post(upload_url, data=data, timeout=600, headers={
+                "x-goog-api-key": self.key, "Content-Length": str(len(data)),
+                "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize"})
+            if done.status_code >= 400:
+                raise GeminiUnavailable(f"Gemini file upload failed (HTTP {done.status_code}).")
+            resource = done.json().get("file") or {}
+        except (requests.RequestException, ValueError) as exc:
+            raise GeminiUnavailable(f"Gemini file upload failed ({type(exc).__name__}).") from exc
+        waited = 0.0
+        while resource.get("state") == "PROCESSING" and waited < wait_seconds:
+            self.sleep(3)
+            waited += 3
+            try:
+                resource = self.session.get(f"{FILES_ROOT}/{resource['name'].split('/')[-1]}", timeout=30,
+                                            headers={"x-goog-api-key": self.key}).json()
+            except (requests.RequestException, ValueError, KeyError) as exc:
+                raise GeminiUnavailable(f"Gemini file status was unavailable ({type(exc).__name__}).") from exc
+        if resource.get("state") not in (None, "ACTIVE") or not resource.get("uri"):
+            raise GeminiUnavailable(f"Gemini could not process the uploaded file ({resource.get('state')}).")
+        return resource
+
+    def delete_file(self, resource):
+        """Best-effort cleanup; uploaded files also expire on their own."""
+        try:
+            self.session.delete(f"{FILES_ROOT}/{str(resource.get('name', '')).split('/')[-1]}",
+                                timeout=30, headers={"x-goog-api-key": self.key})
+        except requests.RequestException:
+            pass
+
+
+def shared_client():
+    """A client when a key is configured and the writer has not been forced local, else None."""
+    if os.getenv("RECAP_WRITER", "auto").strip().lower() == "local" or not configured_key():
+        return None
+    return GeminiClient()

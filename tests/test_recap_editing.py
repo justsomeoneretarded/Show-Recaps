@@ -1,19 +1,12 @@
 """No model downloads: edit policy is exercised with bounded injected analyses."""
-from pathlib import Path
 
 import pytest
 
 from movie_pipeline.core import PipelineError
 from recap_pipeline.editing import (
     MAX_ANALYSED_SOURCES, MAX_NATIVE_SOURCES, UsageTracker, analyse_assets,
-    choose_resolution, ensure_neutral_plate, plan_source_audio, plan_visuals,
+    choose_resolution, plan_source_audio, plan_visuals, scene_catalogue,
 )
-
-
-def plate(season=2):
-    return {"path": f"/neutral-{season}.jpg", "kind": "image", "season": season,
-            "scope": "neutral-title-card", "illustrative": True, "episode_ids": [],
-            "width": 1280, "height": 720}
 
 
 def video(name="clip", *, season=2, ids=None, start=1.0, end=36.0, **extra):
@@ -30,7 +23,7 @@ def image(name="still", *, season=2, ids=None):
 
 
 def assets(*rows, season=2):
-    return {"seasons": {str(season): list(rows)}, "_neutral": plate(season)}
+    return {"seasons": {str(season): list(rows)}}
 
 
 def section(*, season=2, ids=None, name="story", kind="story"):
@@ -47,9 +40,8 @@ def test_rejects_incoming_section_before_selecting_any_visual():
 
 
 def test_manifest_key_cannot_relabel_actual_future_source():
-    result = plan_visuals(section(), "A choice changes things.", 8, assets(video(season=3)), tracker())
-    assert result[0]["scope"] == "neutral-title-card"
-    assert result[0]["source"] == "/neutral-2.jpg"
+    with pytest.raises(PipelineError, match="no blank plate"):
+        plan_visuals(section(), "A choice changes things.", 8, assets(video(season=3)), tracker())
 
 
 def test_episode_map_rejects_wrong_season_paragraph():
@@ -59,8 +51,8 @@ def test_episode_map_rejects_wrong_season_paragraph():
 
 def test_episode_map_rejects_spoofed_source_episode_provenance():
     row = image(ids=["s3e1"])
-    result = plan_visuals(section(ids=["s2e1"]), "A choice.", 8, assets(row), tracker())
-    assert result[0]["scope"] == "neutral-title-card"
+    with pytest.raises(PipelineError, match="no blank plate"):
+        plan_visuals(section(ids=["s2e1"]), "A choice.", 8, assets(row), tracker())
 
 
 def test_exact_known_episode_preferred_to_season_generic():
@@ -80,25 +72,26 @@ def test_wrong_episode_never_becomes_fallback():
     assert any("exact current-episode" in message for message in usage.warnings)
 
 
-def test_unknown_episode_uses_generic_or_neutral_only():
-    result = plan_visuals(section(ids=["s2e1", "s2e2"]), "An uncertain attribution.", 8,
-                          assets(image(ids=["s2e1"])), tracker(), episode_ids=[])
-    assert result[0]["selection"] == "neutral-plate"
+def test_unknown_episode_never_borrows_another_episodes_still():
+    with pytest.raises(PipelineError, match="no blank plate"):
+        plan_visuals(section(ids=["s2e1", "s2e2"]), "An uncertain attribution.", 8,
+                     assets(image(ids=["s2e1"])), tracker(), episode_ids=[])
 
 
-def test_intro_requires_explicit_neutral_instead_of_mixed_seasons():
-    data = assets(video())
-    data["_neutral"] = plate(None)
-    result = plan_visuals(section(season=None, kind="intro"), "The story so far.", 8, data, tracker())
-    assert result[0]["scope"] == "neutral-title-card"
-    assert result[0]["season"] is None
+def test_intro_shows_real_covered_season_footage():
+    result = plan_visuals(section(season=None, kind="intro"), "The story so far.", 8,
+                          assets(video()), tracker())
+    assert result[0]["source"] == "/clip.mp4" and result[0]["season"] == 2
+    assert result[0]["selection"] == "orientation-footage"
 
 
-def test_wrong_season_neutral_is_not_silently_relabelled():
-    data = assets()
-    data["_neutral"] = plate(1)
-    with pytest.raises(PipelineError, match="neutral"):
-        plan_visuals(section(), "A choice.", 8, data, tracker())
+def test_season_without_footage_borrows_another_covered_season():
+    usage = tracker()
+    data = {"seasons": {"1": [video("season-one", season=1)], "2": []}}
+    result = plan_visuals(section(), "A choice.", 8, data, usage)
+    assert result[0]["source"] == "/season-one.mp4" and result[0]["season"] == 1
+    assert result[0]["selection"] == "other-season-fallback"
+    assert any("another covered season" in message for message in usage.warnings)
 
 
 def test_long_paragraph_uses_even_six_to_ten_second_beats():
@@ -117,15 +110,16 @@ def test_usage_survives_paragraph_boundary_instead_of_restarting_clip():
     assert usage.fresh(first[0]["source"], first[0]["start"], first[0]["duration"]) == 0
 
 
-def test_exhausted_source_uses_neutral_instead_of_looping_last_shot():
+def test_exhausted_source_reuses_real_footage_instead_of_a_blank_plate():
     usage, data = tracker(), assets(video(start=1, end=9))
     first = plan_visuals(section(), "First.", 8, data, usage)
     frame = plan_visuals(section(), "A limited moving frame.", 8, data, usage)
     final = plan_visuals(section(), "No more footage.", 8, data, usage)
     assert not first[0]["still"]
     assert frame[0]["still"] and not frame[0]["image"]
-    assert final[0]["selection"] == "neutral-plate"
-    assert any("exhausted" in message for message in usage.warnings)
+    assert final[0]["source"] == "/clip.mp4"
+    assert final[0]["selection"] == "same-season-generic"
+    assert any("reused" in message for message in usage.warnings)
 
 
 def test_short_coherent_scene_becomes_smooth_moving_still():
@@ -152,14 +146,14 @@ def test_weak_semantic_match_is_nonfatal():
     assert result[0]["source"] == "/clip.mp4"
 
 
-def test_analysis_has_shared_six_source_ceiling(tmp_path):
+def test_analysis_has_shared_source_ceiling(tmp_path):
     calls = []
 
     def analyse(path, cache):
         calls.append((path, cache))
         return [{"start": 1, "end": 30, "motion": 1}]
 
-    rows = [video(f"source-{i}") for i in range(9)]
+    rows = [video(f"source-{i}") for i in range(MAX_ANALYSED_SOURCES + 3)]
     for row in rows:
         row.pop("shots")
     usage = tracker()
@@ -168,7 +162,7 @@ def test_analysis_has_shared_six_source_ceiling(tmp_path):
     assert len(calls) == MAX_ANALYSED_SOURCES
     assert len(result) == MAX_ANALYSED_SOURCES
     assert all(path.name.startswith("source-") for path, _ in calls)
-    assert any("six sources" in message for message in usage.warnings)
+    assert any(f"{MAX_ANALYSED_SOURCES} sources" in message for message in usage.warnings)
 
 
 def test_analysis_does_not_process_wrong_season_or_invalid_episode(tmp_path):
@@ -181,7 +175,7 @@ def test_analysis_does_not_process_wrong_season_or_invalid_episode(tmp_path):
     assert calls == []
 
 
-def test_failed_optional_analysis_produces_neutral_fallback(tmp_path):
+def test_failed_optional_analysis_still_uses_the_clip(tmp_path):
     def unavailable(*args):
         raise RuntimeError("Optional analysis is offline")
 
@@ -189,15 +183,33 @@ def test_failed_optional_analysis_produces_neutral_fallback(tmp_path):
     row.pop("shots")
     analyse_assets(assets(row), tmp_path, usage, analyser=unavailable)
     result = plan_visuals(section(), "Complete narration.", 8, assets(row), usage)
-    assert result[0]["selection"] == "neutral-plate"
+    assert result[0]["source"] == "/clip.mp4" and not result[0]["still"]
     assert any("unavailable" in message for message in usage.warnings)
 
 
 def test_title_cards_are_never_selected():
     row = video()
     row["shots"] = [{"start": 1, "end": 30, "text_card": "promo"}]
-    result = plan_visuals(section(), "A choice.", 8, assets(row), tracker())
-    assert result[0]["selection"] == "neutral-plate"
+    with pytest.raises(PipelineError, match="no blank plate"):
+        plan_visuals(section(), "A choice.", 8, assets(row), tracker())
+
+
+def test_gemini_ranking_picks_the_matching_scene():
+    row = video(shots=[{"start": 1, "end": 12, "description": "Two people talk in a kitchen", "quality": 7},
+                       {"start": 20, "end": 32, "description": "A boat sails toward the horizon", "quality": 7}])
+    usage, data = tracker(), assets(row)
+    catalogue = scene_catalogue(section(), "He sails away.", data, usage)
+    assert len(catalogue) == 2 and {"key", "description", "seconds"} <= set(catalogue[0])
+    boat = next(c["key"] for c in catalogue if "boat" in c["description"])
+    result = plan_visuals(section(), "He leaves.", 8, data, usage, preferred=[boat])
+    assert 20 <= result[0]["start"] < 32
+
+
+def test_watermarked_or_dark_scenes_are_avoided_when_clean_ones_exist():
+    row = video(shots=[{"start": 1, "end": 12, "watermark": True, "quality": 6},
+                       {"start": 20, "end": 32, "quality": 6, "dark": False}])
+    result = plan_visuals(section(), "A scene.", 8, assets(row), tracker())
+    assert result[0]["start"] >= 20
 
 
 def test_resolution_uses_source_detail_and_respects_4k_option():
@@ -210,12 +222,7 @@ def test_resolution_uses_source_detail_and_respects_4k_option():
     assert any("Source quality" in message for message in warnings)
 
 
-def test_neutral_plate_has_no_claimed_episode_identity(tmp_path):
-    row = ensure_neutral_plate(tmp_path, "Example Story", 2)
-    assert Path(row["path"]).is_file()
-    assert row["episode_ids"] == []
-    assert row["scope"] == "neutral-title-card"
-    assert row["illustrative"] is True
+
 
 
 def native_cues():
@@ -353,7 +360,7 @@ def test_image_only_analysis_does_not_import_optional_opencv(monkeypatch, tmp_pa
     assert usage.analysed_sources == set()
 
 
-def test_missing_optional_video_dependency_uses_neutral_fallback(monkeypatch, tmp_path):
+def test_missing_optional_video_dependency_still_uses_footage(monkeypatch, tmp_path):
     import builtins
     original = builtins.__import__
 
@@ -366,7 +373,8 @@ def test_missing_optional_video_dependency_uses_neutral_fallback(monkeypatch, tm
     usage, row = tracker(), video()
     row.pop("shots")
     analyse_assets(assets(row), tmp_path, usage)
-    assert plan_visuals(section(), "Complete narration.", 8, assets(row), usage)[0]["selection"] == "neutral-plate"
+    shot = plan_visuals(section(), "Complete narration.", 8, assets(row), usage)[0]
+    assert shot["source"] == "/clip.mp4" and shot["selection"] == "same-season-generic"
 
 
 @pytest.mark.parametrize("seconds", [6.0, 8.0, 9.1, 10.0])

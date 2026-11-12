@@ -160,3 +160,13 @@ def test_provider_selection_from_environment(monkeypatch):
     monkeypatch.setenv("RECAP_WRITER", "cloud")
     with pytest.raises(PipelineError, match="auto, gemini or local"):
         RecapWriter()
+
+
+def test_after_an_exhausted_retry_cycle_no_further_calls_are_made():
+    c, session, sleeps = client(*[Response(429) for _ in range(gemini.MAX_ATTEMPTS)])
+    with pytest.raises(GeminiUnavailable):
+        c.generate_json("s", "p", {"type": "object"})
+    calls = len(session.calls)
+    with pytest.raises(GeminiUnavailable, match="earlier in this run"):
+        c.generate_json("s", "p", {"type": "object"})
+    assert len(session.calls) == calls

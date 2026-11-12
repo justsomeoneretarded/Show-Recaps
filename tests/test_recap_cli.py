@@ -75,7 +75,8 @@ def services(monkeypatch, tmp_path):
 
     monkeypatch.setitem(sys.modules, "recap_pipeline.research", SimpleNamespace(research_show=research))
     monkeypatch.setitem(sys.modules, "recap_pipeline.writing",
-                        SimpleNamespace(RecapWriter=Writer, build_ledger=ledger, write_recap=write))
+                        SimpleNamespace(RecapWriter=Writer, build_ledger=ledger, write_recap=write,
+                                        apply_packaging=lambda script, client: script))
     monkeypatch.setitem(sys.modules, "recap_pipeline.assets", SimpleNamespace(collect_assets=collect))
     monkeypatch.setitem(sys.modules, "recap_pipeline.rendering", SimpleNamespace(render_recap=render))
     return SimpleNamespace(events=events, renders=renders, shared=tmp_path / "shared",

@@ -366,3 +366,26 @@ def test_short_description_chapters_merge_without_padding_the_actual_timeline():
     assert result == [{"start": 0, "title": "Intro / Season 1"},
                       {"start": 30, "title": "Where we left off / Outro"}]
     assert chapters[1]["start"] == 6
+
+
+@media
+def test_chosen_voice_speed_quickens_every_narration_paragraph(tmp_path, monkeypatch, assets):
+    from dataclasses import replace
+    monkeypatch.setattr(render, "music_bed", _quiet_music)
+    monkeypatch.setattr(rendering, "_make_recovery", lambda *a, **k: pytest.fail("Tests must never load speech models."))
+    monkeypatch.setenv("VIDEO_RESOLUTION", "720")
+    monkeypatch.setenv("GENERATED_SCORE", str(tmp_path / "no-generated-score.wav"))
+    results = {}
+    for speed in ("1.0", "1.3"):
+        output, work = tmp_path / f"package-{speed}", tmp_path / f"work-{speed}"
+        report = rendering.render_recap(_script("season"), replace(_spec(), voice_speed=speed), _bundle(),
+                                        assets, output, work, recovery=SyntheticRecovery(tmp_path / f"voice-{speed}"))
+        events = json.loads((output / "timeline.json").read_text())["events"]
+        results[speed] = (report, [e for e in events if e["type"] == "narration"])
+    assert results["1.3"][0]["voice_speed"] == 1.3 and results["1.0"][0]["voice_speed"] == 1.0
+    for slow, fast in zip(results["1.0"][1], results["1.3"][1]):
+        assert fast["pace"] == pytest.approx(min(1.6, slow["pace"] * 1.3), abs=.002)
+        assert fast["duration"] < slow["duration"]
+    # No paragraph is ever shown over a blank title plate.
+    assert all(shot.get("scope") != "neutral-title-card"
+               for _, events in results.values() for e in events for shot in e["shots"])

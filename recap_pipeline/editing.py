@@ -1,7 +1,10 @@
 """Conservative season/episode editing with shared source freshness.
 
-Scene analysis supplies timing and picture quality, never episode identity. The
-asset manifest and researched episode map alone determine source scope.
+Scene analysis (local or Gemini) supplies timing, descriptions and picture
+quality, never episode identity. The asset manifest and researched episode map
+alone determine source scope. Narration is always covered by real footage: when
+a season's fresh footage runs out, the editor reuses its least-used shots, then
+borrows another covered season's footage. It never shows a blank title plate.
 """
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ from pathlib import Path
 
 from movie_pipeline.core import PipelineError
 
-MAX_ANALYSED_SOURCES = 6
+MAX_ANALYSED_SOURCES = 80
 MAX_NATIVE_SOURCES = 4
 MOTIONS = ("zoom_in", "zoom_out")
 STOPWORDS = {"the", "and", "that", "this", "with", "from", "into", "their", "they", "them",
@@ -141,63 +144,26 @@ def _requested_episodes(section, paragraph, explicit, season, usage):
 
 
 def _pool(section, paragraph, assets, usage, explicit):
+    """(season, episode ids, exact rows, same-season generic rows, other-season rows)."""
     season = _current_season(section, usage)
+    every = [(int(key), row) for key, row in _rows(assets)
+             if _integer(key) is not None and _valid_asset(row, _integer(key), usage)]
     if season is None:
-        return None, [], [], []
+        # Intro and outro: any covered season's footage, general footage first. Showing an
+        # episode's clip under orientation narration makes no claim about that episode.
+        generic = [row for _, row in every if not _episode_ids(row.get("episode_ids"))]
+        specific = [row for _, row in every if _episode_ids(row.get("episode_ids"))]
+        return None, [], [], generic, specific
     ids = _requested_episodes(section, paragraph, explicit, season, usage)
-    valid = [row for key, row in _rows(assets)
-             if _integer(key) == season and _valid_asset(row, season, usage)]
+    valid = [row for number, row in every if number == season]
     exact = [row for row in valid if ids and _episode_ids(row.get("episode_ids")) and
              set(_episode_ids(row.get("episode_ids"))).issubset(set(ids))]
     generic = [row for row in valid if not _episode_ids(row.get("episode_ids"))]
+    others = [row for number, row in every if number != season and not _episode_ids(row.get("episode_ids"))]
     # A different episode's still never becomes generic fallback footage.
     if ids and not exact:
-        usage.warn(f"Season {season}: exact current-episode imagery was unavailable; using season-level imagery or an explicit neutral plate.")
-    return season, ids, exact, generic
-
-
-def ensure_neutral_plate(work: Path, show_title: str, season: int | None) -> dict:
-    """An explicit illustrative fallback with no inferred actors, locations or plot."""
-    from PIL import Image, ImageDraw, ImageFont
-    work = Path(work)
-    work.mkdir(parents=True, exist_ok=True)
-    name = hashlib.sha256((str(show_title) + ":" + str(season)).encode()).hexdigest()[:16]
-    path = work / f"recap-neutral-{name}.jpg"
-    if not path.is_file():
-        image = Image.new("RGB", (1280, 720), "#101b26")
-        draw = ImageDraw.Draw(image)
-        draw.rectangle((30, 30, 1249, 689), outline="#80cbc4", width=3)
-
-        def face(size):
-            for font in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"):
-                try:
-                    return ImageFont.truetype(font, size)
-                except OSError:
-                    pass
-            return ImageFont.load_default()
-
-        title = " ".join(str(show_title).split())[:160]
-        size = 72
-        while size > 18 and draw.textbbox((0, 0), title, font=face(size))[2] > 1100:
-            size -= 2
-        draw.text((85, 240), title, font=face(size), fill="white")
-        draw.text((85, 350), f"Season {season}" if season else "The story so far",
-                  font=face(48), fill="#80cbc4")
-        draw.text((85, 595), "ILLUSTRATIVE TITLE PLATE", font=face(22), fill="#b9c8d7")
-        image.save(path, "JPEG", quality=94)
-    return {"path": str(path.resolve()), "kind": "image", "width": 1280, "height": 720,
-            "season": season, "episode_ids": [], "scope": "neutral-title-card",
-            "illustrative": True, "source_url": "", "title": "Illustrative recap title plate"}
-
-
-def _neutral(assets, season):
-    row = assets.get("_neutral") if isinstance(assets, dict) else None
-    if (not isinstance(row, dict) or row.get("kind") != "image"
-            or row.get("scope") != "neutral-title-card" or not row.get("illustrative")
-            or not row.get("path") or row.get("season") != season):
-        raise PipelineError("A scoped explicit neutral plate is required when no safe visual is available.")
-    return row
+        usage.warn(f"Season {season}: exact current-episode imagery was unavailable; using season-level footage.")
+    return season, ids, exact, generic, others
 
 
 def _clean_shots(rows, length):
@@ -227,7 +193,7 @@ def analyse_assets(assets: dict, work: Path, usage: UsageTracker, *, analyser=No
         if path in usage.analysed_sources:
             continue
         if len(usage.analysed_sources) >= MAX_ANALYSED_SOURCES:
-            usage.warn("Visual analysis stopped at six sources; remaining footage uses conservative timing or neutral plates.")
+            usage.warn(f"Visual analysis stopped at {MAX_ANALYSED_SOURCES} sources; remaining footage uses evenly spaced windows.")
             break
         usage.analysed_sources.add(path)
         try:
@@ -239,13 +205,24 @@ def analyse_assets(assets: dict, work: Path, usage: UsageTracker, *, analyser=No
                     analyser = analyse
                 token = hashlib.sha256(path.encode()).hexdigest()[:16]
                 raw = analyser(Path(path), work / f"recap-shots-{token}.json")
-            usage.shots[path] = _clean_shots(raw, length)
+            usage.shots[path] = _clean_shots(raw, length) if raw else _even_windows(length)
             if not usage.shots[path]:
-                usage.warn(f"Season {season}: no coherent moving shots were found in {Path(path).name}; using moving stills or neutral plates.")
+                usage.warn(f"Season {season}: no coherent moving shots were found in {Path(path).name}; using evenly spaced windows.")
         except Exception as exc:  # Optional scene analysis must not fail an otherwise valid recap.
-            usage.shots[path] = []
-            usage.warn(f"Season {season}: optional scene analysis was unavailable ({type(exc).__name__}); using moving stills or neutral plates.")
+            usage.shots[path] = _even_windows(_number(row.get("duration")))
+            usage.warn(f"Season {season}: scene analysis was unavailable for {Path(path).name} "
+                       f"({type(exc).__name__}); using evenly spaced windows of its footage.")
     return dict(usage.shots)
+
+
+def _even_windows(length, size=8.0):
+    """Plain 8-second windows that skip the opening and closing slates of a clip."""
+    start, end = max(1.0, length * 0.05), length * 0.9
+    windows, point = [], start
+    while end - point >= 2.0:
+        windows.append({"start": round(point, 2), "end": round(min(end, point + size), 2), "motion": 0.0})
+        point += size
+    return windows
 
 
 def _free_windows(source, start, end, usage):
@@ -264,85 +241,156 @@ def _free_windows(source, start, end, usage):
     return windows
 
 
-def _visual_options(rows, paragraph, seconds, usage, exact):
+def _shot_key(source, shot):
+    from .gemini_media import scene_key
+    return scene_key(source, shot["start"])
+
+
+def _quality(shot):
+    """Gemini picture notes: favour sharp clean shots, avoid logo bugs and darkness."""
+    return (_number(shot.get("quality"), 5) - 5) / 2 - (3 if shot.get("watermark") else 0) \
+        - (2 if shot.get("dark") else 0)
+
+
+def _visual_options(rows, paragraph, seconds, usage, exact, preferred=None, *, reuse=False):
+    """Candidate shots for one beat. ``reuse`` allows already used footage, least used first."""
     result = []
     text = paragraph.get("text", "") if isinstance(paragraph, dict) else paragraph
+    ranks = {key: index for index, key in enumerate(preferred or [])}
     for row in rows:
         source = str(row["path"])
         match = _relevance(text, str(row.get("title", "")) + " " + str(row.get("description", "")))
         if row["kind"] == "image":
             uses = usage.image_uses[source]
+            if uses and not reuse:
+                continue
             result.append((100 * exact + 12 - uses * 2 + match,
                            {"row": row, "start": 0.0, "still": True, "image": True}))
             continue
         length = _number(row.get("duration"))
-        raw = usage.shots.get(source, _clean_shots(row.get("shots"), length))
-        # Unanalysed clips are not guessed to be one coherent scene.
+        if source in usage.shots:
+            raw = usage.shots[source]
+        elif isinstance(row.get("shots"), list):
+            raw = _clean_shots(row["shots"], length)  # a clip of only title cards stays unused
+        else:
+            raw = _even_windows(length)
         for shot in raw:
             if _number(shot.get("motion")) > 30:
                 continue  # A fast or unstable source becomes a gentle moving frame instead.
+            key = _shot_key(source, shot)
+            bonus = (40 - 4 * ranks[key]) if key in ranks else 0
+            description = str(shot.get("description", "")) + " " + str(shot.get("text", ""))
+            base = (100 * exact + 20 + match + _relevance(text, description) + bonus + _quality(shot)
+                    - min(max(0.0, _number(shot.get("motion"))), 100) / 50
+                    - (2 if usage.last_source == source else 0))
+            if reuse:
+                overlap = 1 - usage.fresh(source, shot["start"], shot["end"] - shot["start"])
+                score = base - 30 * overlap - (8 if usage.last_source == source else 0)
+                if shot["end"] - shot["start"] + .001 >= seconds:
+                    result.append((score, {"row": row, "start": shot["start"], "still": False, "image": False}))
+                else:
+                    # Too short to run for the whole beat: a gently moving frame from its middle.
+                    middle = (shot["start"] + shot["end"]) / 2
+                    result.append((score - 5 - 3 * usage.image_uses[source + f"@{middle:.3f}"],
+                                   {"row": row, "start": middle, "still": True, "image": False,
+                                    "frame_key": source + f"@{middle:.3f}"}))
+                continue
             for start, end in _free_windows(source, shot["start"], shot["end"], usage):
                 if end - start + .001 < seconds:
                     continue
-                motion = max(0.0, _number(shot.get("motion")))
-                description = str(shot.get("description", "")) + " " + str(shot.get("text", ""))
-                score = (100 * exact + 20 + match + _relevance(text, description)
-                         - min(motion, 100) / 50 - (2 if usage.last_source == source else 0))
-                result.append((score, {"row": row, "start": start, "still": False, "image": False}))
+                result.append((base, {"row": row, "start": start, "still": False, "image": False}))
         # A short coherent shot can provide one gently moving frame. Never freeze
         # an arbitrary trailer end or loop its last shot to fill narration.
-        if not any(value[1]["row"] is row for value in result):
+        if not reuse and not any(value[1]["row"] is row for value in result):
             for shot in raw:
                 middle = (shot["start"] + shot["end"]) / 2
                 marker = source + f"@{middle:.3f}"
                 if usage.image_uses[marker] == 0:
-                    result.append((100 * exact + 5 + match,
+                    result.append((100 * exact + 5 + match + _quality(shot),
                                    {"row": row, "start": middle, "still": True,
                                     "image": False, "frame_key": marker}))
     return result
 
 
+def scene_catalogue(section: dict, paragraph, assets: dict, usage: UsageTracker, *, episode_ids=None) -> list[dict]:
+    """In-scope scenes with descriptions, for Gemini to rank against one paragraph."""
+    _, _, exact, generic, others = _pool(section, paragraph, assets, usage, episode_ids)
+    rows = exact or generic or others
+    catalogue = []
+    for row in rows:
+        if row.get("kind") != "video":
+            continue
+        source = str(row["path"])
+        length = _number(row.get("duration"))
+        for shot in usage.shots.get(source, _clean_shots(row.get("shots"), length)):
+            if not shot.get("description"):
+                continue
+            catalogue.append({"key": _shot_key(source, shot), "description": str(shot["description"]),
+                              "seconds": shot["end"] - shot["start"], "quality": shot.get("quality", 5),
+                              "watermark": bool(shot.get("watermark")),
+                              "freshness": usage.fresh(source, shot["start"], shot["end"] - shot["start"])})
+    # Fresh footage first so the model sees what is still unused.
+    catalogue.sort(key=lambda row: -row["freshness"])
+    return catalogue
+
+
 def plan_visuals(section: dict, paragraph, seconds: float, assets: dict, usage: UsageTracker,
-                 *, episode_ids=None) -> list[dict]:
-    """Fill all narration, normally with coherent 6–10 second cuts or moving stills."""
+                 *, episode_ids=None, preferred=None) -> list[dict]:
+    """Fill all narration with real footage, normally coherent 6–10 second cuts.
+
+    Order of preference: this paragraph's episode, fresh same-season footage,
+    fresh footage from another covered season, then the least-used footage again.
+    ``preferred`` is Gemini's ranking of scene keys for this paragraph.
+    """
     seconds = _number(seconds)
     if seconds <= 0:
         raise PipelineError("A recap paragraph must have a positive measured duration.")
-    season, ids, exact, generic = _pool(section, paragraph, assets, usage, episode_ids)
+    season, ids, exact, generic, others = _pool(section, paragraph, assets, usage, episode_ids)
     count = max(1, math.ceil(seconds / 10.0))
     beat_seconds = seconds / count
     plan = []
     for index in range(count):
         wanted = seconds - sum(shot["duration"] for shot in plan) if index == count - 1 else beat_seconds
-        options = _visual_options(exact, paragraph, wanted, usage, True)
+        borrowed = False
+        options = _visual_options(exact, paragraph, wanted, usage, True, preferred)
         if not options:
-            options = _visual_options(generic, paragraph, wanted, usage, False)
-        if options:
-            _, chosen = max(options, key=lambda item: item[0])
-            row = chosen["row"]
-        else:
-            row = _neutral(assets, season)
-            chosen = {"row": row, "start": 0.0, "still": True, "image": True}
-            if season is not None:
-                usage.warn(f"Season {season}: safe fresh imagery was exhausted or unavailable; an explicit neutral title plate fills the remaining narration.")
+            options = _visual_options(generic, paragraph, wanted, usage, False, preferred)
+        if not options and others:
+            options = _visual_options(others, paragraph, wanted, usage, False, preferred)
+            borrowed = bool(options)
+        if not options:
+            options = _visual_options(exact + generic, paragraph, wanted, usage, False, preferred, reuse=True)
+            if options and season is not None:
+                usage.warn(f"Season {season}: fresh footage ran out, so some shots are reused.")
+        if not options and others:
+            options = _visual_options(others, paragraph, wanted, usage, False, preferred, reuse=True)
+            borrowed = bool(options)
+        if not options:
+            raise PipelineError("No footage or imagery is available for this recap; "
+                                "no blank plate is used. Add or refresh YOUTUBE_COOKIES and run again.")
+        _, chosen = max(options, key=lambda item: item[0])
+        row = chosen["row"]
+        borrowed = borrowed and season is not None
+        if borrowed:
+            usage.warn(f"Season {season}: footage from another covered season fills part of its narration.")
         source = str(row["path"])
         row_ids = _episode_ids(row.get("episode_ids"))
-        if row_ids and (not ids or not set(row_ids).issubset(set(ids))):
+        if season is not None and row_ids and (not ids or not set(row_ids).issubset(set(ids))):
             raise PipelineError("An episode-specific asset escaped the current paragraph's scope.")
         shot = {"source": source, "path": source, "start": chosen["start"], "duration": wanted,
                 "still": chosen["still"], "image": chosen["image"], "freeze": 0.0,
-                "still_motion": MOTIONS[usage.beat % len(MOTIONS)], "season": season,
+                "still_motion": MOTIONS[usage.beat % len(MOTIONS)],
+                "season": _integer(row.get("season")) if (borrowed or season is None) else season,
                 "episode_id": row_ids[0] if len(row_ids) == 1 else None, "episode_ids": row_ids,
                 "scope": row.get("scope", "season"), "illustrative": bool(row.get("illustrative")),
                 "source_url": row.get("source_url", ""),
                 "selection": "current-episode" if row_ids else
-                             "neutral-plate" if row.get("scope") == "neutral-title-card" else "same-season-generic"}
+                             "other-season-fallback" if borrowed else
+                             "orientation-footage" if season is None else "same-season-generic"}
         plan.append(shot)
         usage.beat += 1
         usage.last_source = source
         if shot["still"]:
-            if usage.image_uses[chosen.get("frame_key", source)] and row.get("scope") != "neutral-title-card":
-                usage.warn(f"Season {season}: limited verified imagery requires a repeated moving still.")
             usage.image_uses[chosen.get("frame_key", source)] += 1
             if not chosen["image"]:
                 usage.reserve(source, max(0.0, chosen["start"] - .1), .2)
@@ -354,11 +402,11 @@ def plan_visuals(section: dict, paragraph, seconds: float, assets: dict, usage: 
 def choose_resolution(assets: dict, try_4k: bool) -> tuple[int, int, list[str]]:
     """Use actual scoped source detail; report any enlargement and quality limits."""
     ceiling = 2160 if try_4k else 1080
-    rows = [row for _, row in _rows(assets) if row.get("scope") != "neutral-title-card"]
+    rows = [row for _, row in _rows(assets)]
     dimensions = [(int(_number(row.get("width"))), int(_number(row.get("height")))) for row in rows]
     dimensions = [(width, height) for width, height in dimensions if width > 0 and height > 0]
     if not dimensions:
-        return 1280, 720, ["No verified photographic source detail was available; rendering neutral plates at 720p."]
+        return 1280, 720, ["No verified photographic source detail was available; rendering at 720p."]
     sizes = ((3840, 2160), (2560, 1440), (1920, 1080), (1280, 720),
              (854, 480), (640, 360), (426, 240), (256, 144))
     selected = None
@@ -420,7 +468,7 @@ def plan_source_audio(section: dict, paragraph, assets: dict, usage: UsageTracke
     At most four unique sources receive ASR in one recap. No recognizer, complete
     phrase, fresh coherent scene, or lexical connection means no native insert.
     """
-    season, ids, exact, _ = _pool(section, paragraph, assets, usage, episode_ids)
+    season, ids, exact, _, _ = _pool(section, paragraph, assets, usage, episode_ids)
     section_id = str(section.get("id", ""))
     if (season is None or len(ids) != 1 or not callable(analyser)
             or section.get("kind") not in {"story", "ending"}

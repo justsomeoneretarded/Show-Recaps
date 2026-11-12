@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PIL import Image, ImageStat
+from PIL import Image
 
 from movie_pipeline.core import PipelineError
 from recap_pipeline import assets
@@ -169,26 +169,20 @@ def test_future_or_wrong_season_images_and_unscoped_poster_are_excluded(monkeypa
     bundle["seasons"][0]["episodes"].append(undated)
     monkeypatch.setattr(assets.requests, "get",
                         lambda *args, **kwargs: pytest.fail("Unsafe image URL was requested."))
-    result = assets.collect_assets(bundle, spec, tmp_path)
-    item = result["seasons"]["1"][0]
-    assert item["scope"] == "neutral-title-card"
-    assert item["episode_ids"] == [] and item["illustrative"]
-    assert item["source_url"] == "" and result["sources"] == []
-    assert any("poster was excluded" in warning for warning in result["warnings"])
-    with Image.open(item["path"]) as image:
-        assert image.size == (1280, 720)
-        assert ImageStat.Stat(image).stddev[0] > 10
+    # Nothing safe exists: the run stops instead of rendering a blank title plate.
+    with pytest.raises(PipelineError, match="no blank-plate video"):
+        assets.collect_assets(bundle, spec, tmp_path)
+    assert not list(tmp_path.rglob("*neutral*"))
 
 
-def test_network_failure_still_creates_honest_neutral_plate(monkeypatch, tmp_path, bundle, spec):
+def test_network_failure_stops_instead_of_making_a_blank_plate(monkeypatch, tmp_path, bundle, spec):
     no_video(monkeypatch)
 
     def failed(*args, **kwargs):
         raise assets.requests.ConnectionError("provider unavailable")
     monkeypatch.setattr(assets.requests, "get", failed)
-    result = assets.collect_assets(bundle, spec, tmp_path)
-    assert result["seasons"]["1"][0]["scope"] == "neutral-title-card"
-    assert any("no verified season imagery" in warning for warning in result["warnings"])
+    with pytest.raises(PipelineError, match="YOUTUBE_COOKIES"):
+        assets.collect_assets(bundle, spec, tmp_path)
 
 
 def test_only_explicit_prior_season_poster_can_be_illustrative_fallback(monkeypatch, tmp_path, bundle, spec):
@@ -347,7 +341,7 @@ def test_source_download_attempts_are_bounded_even_if_every_probe_fails(monkeypa
     import yt_dlp
     monkeypatch.setattr(assets, "require_disk", lambda *args: None)
     monkeypatch.setattr(assets.download_access, "routes", lambda: ["direct"])
-    calls = []
+    calls, searched = [], []
 
     class YDL:
         def __init__(self, options):
@@ -361,7 +355,8 @@ def test_source_download_attempts_are_bounded_even_if_every_probe_fails(monkeypa
 
         def extract_info(self, query, download=False):
             if query.startswith("ytsearch"):
-                return {"entries": [{"id": f"abcde{number:06}"} for number in range(4)]}
+                searched.append(query)
+                return {"entries": [{"id": f"q{len(searched):04}{number:06}"} for number in range(4)]}
             return info()
 
         def download(self, urls):
@@ -372,7 +367,7 @@ def test_source_download_attempts_are_bounded_even_if_every_probe_fails(monkeypa
     monkeypatch.setattr(assets, "probe", lambda path: {"streams": [], "format": {"duration": "95"}})
     monkeypatch.setattr(assets.requests, "get", lambda *args, **kwargs: Response(_jpeg()))
     result = assets.collect_assets(bundle, spec, tmp_path)
-    assert len(calls) == assets.MAX_DOWNLOAD_ATTEMPTS
+    assert len(calls) == assets.MAX_DOWNLOAD_ATTEMPTS == 30
     assert result["seasons"]["1"][0]["kind"] == "image"
     assert not list(tmp_path.rglob("*.mp4"))
 
@@ -483,10 +478,10 @@ def test_unreachable_provider_stops_after_six_failures_including_poster(monkeypa
         calls.append(url)
         raise assets.requests.ConnectionError("provider unavailable")
     monkeypatch.setattr(assets.requests, "get", get)
-    result = assets.collect_assets(bundle, spec, tmp_path)
+    with pytest.raises(PipelineError, match="no blank-plate video"):
+        assets.collect_assets(bundle, spec, tmp_path)
     assert len(calls) == assets.MAX_IMAGE_FAILURES == 6
     assert all("current-poster" not in url for url in calls)
-    assert result["seasons"]["1"][0]["scope"] == "neutral-title-card"
 
 
 def test_total_image_attempt_limit_is_independent_of_failures(monkeypatch, tmp_path, bundle, spec):
@@ -529,7 +524,7 @@ def test_legacy_three_image_cache_is_validated_reused_and_enriched(monkeypatch, 
     assert len(result["seasons"]["1"]) == 9
     assert len(calls) == 6 and not cached_urls.intersection(calls)
     upgraded = json.loads(manifest.read_text())
-    assert upgraded["version"] == assets.CACHE_VERSION == 2
+    assert upgraded["version"] == assets.CACHE_VERSION == 3
     assert upgraded["image_limit"] == 32
     assert len(upgraded["assets"]) == 9
 
