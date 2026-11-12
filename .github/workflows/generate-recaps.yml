@@ -110,6 +110,8 @@ env:
   # auto (Gemini when the key is set), gemini or local; set as a repository variable.
   RECAP_WRITER: ${{ vars.RECAP_WRITER || 'auto' }}
   RECAP_MAX_CLIPS_PER_SEASON: ${{ vars.RECAP_MAX_CLIPS_PER_SEASON || '14' }}
+  # Seconds between Gemini requests; spacing keeps the free tier under its per-minute limit.
+  GEMINI_MIN_INTERVAL: ${{ vars.GEMINI_MIN_INTERVAL || '6' }}
   HF_HOME: ${{ github.workspace }}/work/models/huggingface
   TORCH_HOME: ${{ github.workspace }}/work/models/torch
   HF_HUB_DISABLE_XET: "1"
