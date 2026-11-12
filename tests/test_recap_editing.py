@@ -382,3 +382,21 @@ def test_complete_six_to_ten_second_paragraph_stays_one_coherent_beat(seconds):
     result = plan_visuals(section(), "A complete short paragraph.", seconds, assets(video()), tracker())
     assert len(result) == 1
     assert result[0]["duration"] == seconds
+
+
+def test_low_resolution_clips_are_dropped_when_sharp_ones_exist():
+    from recap_pipeline.editing import prefer_sharp_sources
+    rows = [video(f"hd{i}", height=1080) for i in range(3)] + [video("sd", height=480)]
+    kept, warnings = prefer_sharp_sources(assets(*rows))
+    assert [r["path"] for r in kept["seasons"]["2"]] == ["/hd0.mp4", "/hd1.mp4", "/hd2.mp4"]
+    assert warnings and choose_resolution(kept, False)[:2] == (1920, 1080)
+    # With too few sharp clips nothing is removed.
+    few, none = prefer_sharp_sources(assets(video("hd", height=1080), video("sd", height=480)))
+    assert len(few["seasons"]["2"]) == 2 and none == []
+
+
+def test_edit_spreads_across_clips_instead_of_leaning_on_one():
+    usage, data = tracker(), assets(video("one", start=1, end=39), video("two", start=1, end=39),
+                                    video("three", start=1, end=39))
+    used = {plan_visuals(section(), f"Paragraph {i}.", 8, data, usage)[0]["source"] for i in range(6)}
+    assert used == {"/one.mp4", "/two.mp4", "/three.mp4"}

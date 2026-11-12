@@ -24,7 +24,7 @@ from movie_pipeline.subtitles import script_cues
 from movie_pipeline.timing import DurationSpec
 
 from .editing import (UsageTracker, analyse_assets, choose_resolution, plan_source_audio,
-                      plan_visuals, scene_catalogue)
+                      plan_visuals, prefer_sharp_sources, scene_catalogue)
 from .gemini import shared_client
 from .gemini_media import rank_scenes
 from .models import voice_speed_value
@@ -272,7 +272,9 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
                                              for season in sorted(allowed)},
                          "sources": [source for source in assets.get("sources", [])
                                      if source.get("season") in allowed]}
+        scoped_assets, sharp_warnings = prefer_sharp_sources(scoped_assets)
         width, height, warnings = choose_resolution(scoped_assets, bool(_value(spec, "try_4k", False)))
+        warnings = [*sharp_warnings, *warnings]
         report["warnings"].extend([*script.get("warnings", []), *assets.get("warnings", []), *warnings])
         report["resolution"] = {"width": width, "height": height, "ceiling": 2160 if _value(spec, "try_4k", False) else 1080}
         genres = " ".join(map(str, bundle.get("show", {}).get("genres") or []))

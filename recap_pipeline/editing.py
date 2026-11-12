@@ -19,6 +19,8 @@ from movie_pipeline.core import PipelineError
 
 MAX_ANALYSED_SOURCES = 80
 MAX_NATIVE_SOURCES = 4
+DIVERSITY_SECONDS = 12.0  # one point of score lost per 12 s already used from a clip
+SHARP_SHARE = 0.66
 MOTIONS = ("zoom_in", "zoom_out")
 STOPWORDS = {"the", "and", "that", "this", "with", "from", "into", "their", "they", "them",
              "then", "have", "has", "was", "were", "are", "for", "but", "not", "his", "her",
@@ -70,6 +72,7 @@ class UsageTracker:
     native_sections: set[str] = field(default_factory=set)
     last_source: str | None = None
     beat: int = 0
+    source_seconds: dict[str, float] = field(default_factory=lambda: defaultdict(float))
 
     def __post_init__(self):
         incoming = _integer(self.upcoming_season)
@@ -90,6 +93,7 @@ class UsageTracker:
     def reserve(self, source, start, seconds):
         if seconds > 0:
             self.intervals[str(source)].append((float(start), float(start + seconds)))
+            self.source_seconds[str(source)] += float(seconds)
 
     def fresh(self, source, start, seconds):
         end = start + seconds
@@ -282,7 +286,9 @@ def _visual_options(rows, paragraph, seconds, usage, exact, preferred=None, *, r
             description = str(shot.get("description", "")) + " " + str(shot.get("text", ""))
             base = (100 * exact + 20 + match + _relevance(text, description) + bonus + _quality(shot)
                     - min(max(0.0, _number(shot.get("motion"))), 100) / 50
-                    - (2 if usage.last_source == source else 0))
+                    - (2 if usage.last_source == source else 0)
+                    # Spread the edit across every clip instead of leaning on one.
+                    - usage.source_seconds[source] / DIVERSITY_SECONDS)
             if reuse:
                 overlap = 1 - usage.fresh(source, shot["start"], shot["end"] - shot["start"])
                 score = base - 30 * overlap - (8 if usage.last_source == source else 0)
@@ -513,3 +519,27 @@ def plan_source_audio(section: dict, paragraph, assets: dict, usage: UsageTracke
             usage.native_sections.add(section_id)
             return clip
     return None
+
+
+def prefer_sharp_sources(assets: dict) -> tuple[dict, list[str]]:
+    """Leave out clearly low-resolution clips when at least three sharp ones exist.
+
+    One 480p upload otherwise pulls the whole recap down to its resolution.
+    """
+    seasons = assets.get("seasons", {}) if isinstance(assets, dict) else {}
+    videos = [row for rows in seasons.values() if isinstance(rows, list) for row in rows
+              if isinstance(row, dict) and row.get("kind") == "video"]
+    heights = sorted((int(_number(row.get("height"))) for row in videos), reverse=True)
+    if len(heights) < 4:
+        return assets, []
+    floor = heights[2] * SHARP_SHARE
+    kept = {key: [row for row in rows if not (isinstance(row, dict) and row.get("kind") == "video"
+                                               and _number(row.get("height")) < floor)]
+            for key, rows in seasons.items()}
+    # Never empty a season to gain sharpness.
+    for key, rows in seasons.items():
+        if not kept[key]:
+            kept[key] = rows
+    dropped = sum(len(rows) for rows in seasons.values()) - sum(len(rows) for rows in kept.values())
+    warnings = [f"{dropped} low-resolution clip(s) were left out so the recap keeps sharp footage."] if dropped else []
+    return {**assets, "seasons": kept}, warnings
