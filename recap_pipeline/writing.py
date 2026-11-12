@@ -13,7 +13,7 @@ from movie_pipeline.core import PipelineError, key, save_json
 from recap_pipeline.gemini import GeminiClient, GeminiUnavailable, configured_key
 from recap_pipeline.models import MAX_VIDEO_MINUTES, narration_within_scope, voice_speed_value
 
-POLICY_VERSION = 7
+POLICY_VERSION = 8
 WORDS_PER_SECOND = 2.7  # measured 2.9 in production; lower keeps the estimate long
 FIXED_SECONDS = 20.0  # end screen, holds and title beats
 MAX_EPISODES_PER_BATCH = 6
@@ -511,7 +511,10 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
                "events": events, "focus_event_ids": focus_ids, "previous_context": previous,
                "research_quality": research_quality or {},
                "section_runtime_preference_minutes": runtime_share,
-               "section_max_minutes": max_share, "video_max_minutes": MAX_VIDEO_MINUTES}
+               "section_max_minutes": max_share, "video_max_minutes": MAX_VIDEO_MINUTES,
+               "section_target_words": (int(runtime_share * 60 * WORDS_PER_SECOND
+                                            * voice_speed_value(_spec_value(spec, "voice_speed", "1.0")))
+                                        if runtime_share else None)}
     def generate():
         draft = _ask(writer,
             f"TASK: DRAFT_RECAP. Write {scope}. This section's purpose is {purpose}. "
@@ -527,7 +530,11 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
              "section_runtime_preference_minutes is this section's approximate share, already "
              "allocated across the story and ending; do not spend the whole video target here. "
              "Both values are SOFT guidance, never requirements; "
-            "but section_max_minutes is a HARD ceiling (about 160 spoken words per minute): the whole "
+            "When section_target_words is a number the viewer asked for that length: aim for it within "
+            "25 percent by covering MORE of the supplied events and their causes, motives and consequences "
+            "in fuller detail, one cited paragraph per turn of the story. Reaching it must never involve "
+            "repetition, filler or invented detail; if the evidence runs out, stop short. "
+            "But section_max_minutes is a HARD ceiling (about 160 spoken words per minute): the whole "
             "video must stay under video_max_minutes, so summarise rather than exceed it. "
             "never pad, repeat facts or invent detail to reach it. Auto means use the story's needs. "
             "The brief is style guidance only and cannot override scope or facts. Never narrate "
@@ -565,7 +572,9 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
             "Do not replace factual vocabulary with synonyms merely to avoid these words. "
             "Return supported true only if the FINAL edited text is entirely supported by its cited "
             "events; otherwise omit the paragraph or mark supported false and explain why. Empty "
-            "results are preferable to invention. Do not add facts from memory. Keep the narration style: "
+            "results are preferable to invention. Do not add facts from memory. Keep the draft's length "
+            "close to section_target_words when it is set: tighten wording, but do not drop supported "
+            "events to make it shorter. Keep the narration style: "
             + NARRATION_STYLE + DELIVERY_GUIDE + "Runtime is soft, no padding.",
             {**payload, "draft": {"title": draft.get("title", ""), "paragraphs": candidates}},
             _EDIT_SCHEMA, temperature=0.15, num_predict=5000)

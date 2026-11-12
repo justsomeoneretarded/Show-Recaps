@@ -82,8 +82,9 @@ def test_clip_is_watched_through_a_small_proxy_and_cached(tmp_path):
                          "thumbnail_times": [3.0]})
     first = gemini_media.analyse_clip(client, clip, 6.0, SHOW, 1, [], tmp_path / "work")
     assert first["scenes"][0]["description"] == "Test pattern" and first["thumbnail_times"] == [3.0]
-    assert client.uploads[0].name.endswith("-gemini-proxy.mp4") and client.deleted == ["files/abc"]
-    assert client.calls[0][1]["media"][0]["fileData"]["fileUri"] == "https://files.example/abc"
+    # A small preview goes inline: no separate upload that could fail.
+    assert client.uploads == [] and client.calls[0][1]["media"][0]["inlineData"]["mimeType"] == "video/mp4"
+    assert client.calls[0][1]["media_resolution"] == "MEDIA_RESOLUTION_LOW"
     # The second request is served from the cache next to the clip, with no new call.
     assert gemini_media.analyse_clip(FakeGemini(), clip, 6.0, SHOW, 1, [], tmp_path / "work") == first
 
@@ -241,3 +242,34 @@ def test_logging_attaches_gemini_scenes_to_each_clip(monkeypatch, tmp_path):
     assert rows[0]["thumbnail_times"] == [4] and "shots" not in rows[1]
     assert any("Gemini logged scenes in 1 of 1" in w for w in warnings)
     assert json.dumps(rows)  # still a serialisable manifest
+
+
+@media
+def test_oversized_preview_uses_the_file_api_and_cleans_up(tmp_path, monkeypatch):
+    clip = tmp_path / "long.mp4"
+    ffmpeg("-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24:duration=4",
+           "-c:v", "libx264", "-preset", "ultrafast", clip)
+    monkeypatch.setattr(gemini_media, "MAX_INLINE_BYTES", 1)
+    client = FakeGemini({"scenes": [], "thumbnail_times": []})
+    gemini_media.analyse_clip(client, clip, 4.0, SHOW, 1, [], tmp_path / "work")
+    assert client.uploads[0].name.endswith("-gemini-proxy.mp4") and client.deleted == ["files/abc"]
+    assert client.calls[0][1]["media"][0]["fileData"]["fileUri"] == "https://files.example/abc"
+
+
+def test_failed_analysis_logs_the_reason(tmp_path, monkeypatch, capsys):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"not a real video")
+    monkeypatch.setattr(gemini_media, "_proxy", lambda path, work: clip)
+    client = FakeGemini(error=GeminiUnavailable("Gemini stopped early: MAX_TOKENS."))
+    assert gemini_media.analyse_clip(client, clip, 30.0, SHOW, 1, [], tmp_path) is None
+    assert "MAX_TOKENS" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("title", [
+    "The Terminal List Season 1 Trailer Legendado", "The Terminal List Season 1 Clip Dublado",
+    "The Terminal List Season 1 Trailer Deutsch", "The Terminal List Season 1 Tráiler Español",
+    "The Terminal List Season 1 Clip VOSTFR"])
+def test_foreign_reuploads_with_burned_in_captions_are_rejected(title):
+    info = {"title": title, "description": "", "duration": 120}
+    assert not assets.candidate_ok(info, SHOW, 1, 2)
+    assert assets.candidate_ok({**info, "title": "The Terminal List Season 1 Official Trailer"}, SHOW, 1, 2)

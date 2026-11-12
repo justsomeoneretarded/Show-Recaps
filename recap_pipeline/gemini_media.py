@@ -8,6 +8,7 @@ caller keeps its deterministic behaviour.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -24,6 +25,7 @@ MAX_SCENE_SECONDS = 20.0
 MIN_SCENE_SECONDS = 1.0
 MAX_CATALOGUE = 90
 PROXY_HEIGHT = 360
+MAX_INLINE_BYTES = 14_000_000  # request bodies stay under the 20 MB inline limit
 
 SYSTEM = (
     "You are a meticulous video editor's assistant for television recap videos. "
@@ -148,7 +150,13 @@ def analyse_clip(client, path: Path, length: float, show: dict, season: int,
     resource = None
     try:
         proxy = _proxy(path, Path(work))
-        resource = client.upload_file(proxy, "video/mp4", display_name=f"recap-s{season}-{path.stem}"[:60])
+        if proxy.stat().st_size <= MAX_INLINE_BYTES:
+            # Small previews travel inside the request: no separate upload step to fail.
+            media = [{"inlineData": {"mimeType": "video/mp4",
+                                     "data": base64.b64encode(proxy.read_bytes()).decode("ascii")}}]
+        else:
+            resource = client.upload_file(proxy, "video/mp4", display_name=f"recap-s{season}-{path.stem}"[:60])
+            media = [{"fileData": {"mimeType": resource.get("mimeType", "video/mp4"), "fileUri": resource["uri"]}}]
         raw = client.generate_json(SYSTEM, (
             "TASK: LOG_SCENES. You are logging footage for a recap of ONE season of a TV show. "
             f"The clip lasts {length:.1f} seconds. List every distinct shot or scene in order with start "
@@ -163,11 +171,10 @@ def analyse_clip(client, path: Path, length: float, show: dict, season: int,
             "or striking action, without text or watermark.\nDATA: " + json.dumps(
                 {"show": show.get("title"), "season": season, "episode_titles": episode_titles[:30]},
                 ensure_ascii=False)),
-            SCENE_SCHEMA, media=[{"fileData": {"mimeType": resource.get("mimeType", "video/mp4"),
-                                               "fileUri": resource["uri"]}}],
-            media_resolution="MEDIA_RESOLUTION_LOW")
+            SCENE_SCHEMA, media=media, media_resolution="MEDIA_RESOLUTION_LOW")
     except (GeminiUnavailable, PipelineError, OSError, KeyError) as exc:
-        print(f"Gemini clip analysis skipped for {path.name} ({type(exc).__name__}).", flush=True)
+        # The messages carry HTTP status and state only; the key is sent in a header, never echoed.
+        print(f"Gemini clip analysis skipped for {path.name} ({type(exc).__name__}: {str(exc)[:200]}).", flush=True)
         return None
     finally:
         if resource is not None:

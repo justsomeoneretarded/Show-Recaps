@@ -40,7 +40,10 @@ MAX_IMAGES = 32
 REJECT = re.compile(
     r"\b(concept|fan.?made|ai.?generated|deepfake|remake|reaction|review|"
     r"recap|explained|analysis|full\s+(?:episode|season|series|movie)|"
-    r"complete\s+(?:episode|season|series)|commentary|reactions?|reviews?|recaps?|fan\s+edit)\b", re.I)
+    r"complete\s+(?:episode|season|series)|commentary|reactions?|reviews?|recaps?|fan\s+edit|"
+    # Dubbed or subtitled foreign re-uploads carry burned-in captions and channel logos.
+    r"legendad[oa]s?|dublad[oa]s?|doblad[oa]s?|subtitulad[oa]s?|sottotitolat[oi]|vostfr|vost|"
+    r"deutsch|espa[nñ]ol|portugu[eê]s|fran[cç]ais|italiano|hindi|türkçe|dubbed|subbed)\b", re.I)
 PROMO = re.compile(r"\b(trailer|teaser|scene|scenes|clip|clips|preview|moment|moments)\b", re.I)
 SEASON = re.compile(r"\bseasons?\s*0*(\d{1,2})(?!\d)|\bs0*(\d{1,2})(?:e\d{1,3})?\b", re.I)
 ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
