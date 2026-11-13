@@ -184,7 +184,40 @@ def _clean_shots(rows, length):
     return result
 
 
-def analyse_assets(assets: dict, work: Path, usage: UsageTracker, *, analyser=None) -> dict:
+CAPTION_WORDS = 3  # three or more readable words in a frame means burned-in text
+
+
+def _frame_text(path, seconds):
+    """OCR of one frame; empty when OCR or the frame is unavailable."""
+    from movie_pipeline.shots import frame_text, get_frame
+    try:
+        return frame_text(get_frame(Path(path), seconds))
+    except Exception:  # OCR is a safety net, never a failure.
+        return ""
+
+
+def _without_text(path, shots, reader):
+    """Drop scenes showing subscribe screens, captions or title cards.
+
+    Gemini flags these when it logs a clip; this covers clips it could not log.
+    """
+    try:
+        from movie_pipeline.shots import PROMO_TEXT
+    except ImportError:  # without the optional video tools there is no OCR to apply
+        return list(shots)
+    kept = []
+    for shot in shots:
+        if shot.get("source") == "gemini":
+            kept.append(shot)
+            continue
+        text = reader(path, (shot["start"] + shot["end"]) / 2)
+        if PROMO_TEXT.search(text) or len(re.findall(r"\b[A-Za-z]{3,}\b", text)) >= CAPTION_WORDS:
+            continue
+        kept.append(shot)
+    return kept
+
+
+def analyse_assets(assets: dict, work: Path, usage: UsageTracker, *, analyser=None, text_reader=None) -> dict:
     """Analyse at most six prior-season videos, without downloading matching models.
 
     The local cut/motion analyser is sufficient. Optional matching descriptions in
@@ -213,10 +246,16 @@ def analyse_assets(assets: dict, work: Path, usage: UsageTracker, *, analyser=No
                 token = hashlib.sha256(path.encode()).hexdigest()[:16]
                 raw = analyser(Path(path), work / f"recap-shots-{token}.json")
             usage.shots[path] = _clean_shots(raw, length) if raw else _even_windows(length)
+            before = len(usage.shots[path])
+            usage.shots[path] = _without_text(path, usage.shots[path], text_reader or _frame_text)
+            if len(usage.shots[path]) < before:
+                usage.warn(f"Season {season}: {before - len(usage.shots[path])} scene(s) with on-screen text "
+                           f"or subscribe screens were left out of {Path(path).name}.")
             if not usage.shots[path]:
                 usage.warn(f"Season {season}: no coherent moving shots were found in {Path(path).name}; using evenly spaced windows.")
         except Exception as exc:  # Optional scene analysis must not fail an otherwise valid recap.
-            usage.shots[path] = _even_windows(_number(row.get("duration")))
+            usage.shots[path] = _without_text(path, _even_windows(_number(row.get("duration"))),
+                                              text_reader or _frame_text)
             usage.warn(f"Season {season}: scene analysis was unavailable for {Path(path).name} "
                        f"({type(exc).__name__}); using evenly spaced windows of its footage.")
     return dict(usage.shots)

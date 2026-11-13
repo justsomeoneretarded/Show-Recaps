@@ -177,3 +177,17 @@ def test_dark_grey_letterbox_bars_are_detected(tmp_path):
     ffmpeg("-f", "lavfi", "-i", "testsrc2=size=640x288:rate=24:duration=12",
            "-vf", "pad=640:360:0:36:0x1c1c14", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", clip)
     assert assets._letterbox_crop(clip)
+
+
+def test_unlogged_scenes_with_captions_or_subscribe_screens_are_dropped(tmp_path):
+    from recap_pipeline.editing import analyse_assets
+    clip = {"kind": "video", "path": "/fan.mp4", "season": 2, "episode_ids": [], "scope": "season",
+            "duration": 40.0, "width": 1920, "height": 1080,
+            "shots": [{"start": 1, "end": 9}, {"start": 10, "end": 18}, {"start": 20, "end": 28},
+                      {"start": 30, "end": 38, "source": "gemini", "description": "logged and clean"}]}
+    texts = {5.0: "YOU MAY LIKE SUBSCRIBE NOW", 14.0: "Reacher Does Russian Roulette", 24.0: "IP"}
+    usage = UsageTracker(3, episode_seasons={})
+    shots = analyse_assets({"seasons": {"2": [clip]}}, tmp_path, usage,
+                           text_reader=lambda path, second: texts.get(second, ""))["/fan.mp4"]
+    assert [s["start"] for s in shots] == [20, 30]
+    assert any("on-screen text" in w for w in usage.warnings)
