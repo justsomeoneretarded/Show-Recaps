@@ -81,6 +81,32 @@ def research_stage(shared):
     return bundle
 
 
+def _unload(writer):
+    # A failed unload must not mask a useful writing/scope failure. Rendering
+    # also unloads the configured model before loading speech on its runner.
+    try:
+        writer.unload()
+    except Exception:
+        print("Writing model unload could not be confirmed.", flush=True)
+
+
+def ledger_stage(shared):
+    """Extract the sourced story events first, so footage can be linked to them."""
+    from .writing import RecapWriter, build_ledger
+
+    shared = Path(shared)
+    bundle = _read(shared / "research.json")
+    cache = shared / "writing-cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    writer = RecapWriter(cache)
+    try:
+        ledger = build_ledger(bundle, cache, writer)
+        save_json(shared / "story-ledger.json", ledger)
+        return ledger
+    finally:
+        _unload(writer)
+
+
 def write_stage(shared):
     from .gemini import shared_client
     from .writing import RecapWriter, apply_packaging, build_ledger, write_recap
@@ -90,13 +116,16 @@ def write_stage(shared):
     bundle = _read(shared / "research.json")
     cache = shared / "writing-cache"
     cache.mkdir(parents=True, exist_ok=True)
+    # Seconds of linked footage per story event, when clips were collected first.
+    footage_path = shared / "footage.json"
+    footage = _read(footage_path) if footage_path.exists() else {}
     writer = RecapWriter(cache)
     try:
         ledger = build_ledger(bundle, cache, writer)
         save_json(shared / "story-ledger.json", ledger)
         scripts = {}
         for kind in kinds_for(spec):
-            script = write_recap(kind, spec, bundle, ledger, cache, writer)
+            script = write_recap(kind, spec, bundle, ledger, cache, writer, footage=footage)
             script = apply_packaging(script, shared_client())
             draft = shared / f"{kind}-draft.json"
             save_json(draft, script)
@@ -106,23 +135,25 @@ def write_stage(shared):
             scripts[kind] = script
         return scripts
     finally:
-        # A failed unload must not mask a useful writing/scope failure. Rendering
-        # also unloads the configured model before loading speech on its runner.
-        try:
-            writer.unload()
-        except Exception:
-            print("Writing model unload could not be confirmed.", flush=True)
+        _unload(writer)
 
 
 def assets_stage(shared):
-    from .assets import collect_assets
+    from .assets import collect_assets, link_footage
+    from .gemini import shared_client
 
     shared = Path(shared)
     spec = load_spec(shared)
     bundle = _read(shared / "research.json")
     for kind in kinds_for(spec):
-        validate_script_scope(_read(shared / f"{kind}-script.json"), spec, bundle)
+        script = shared / f"{kind}-script.json"
+        if script.exists():
+            validate_script_scope(_read(script), spec, bundle)
     assets = collect_assets(bundle, spec, (shared / "asset-cache").resolve())
+    ledger_path = shared / "story-ledger.json"
+    if ledger_path.exists():
+        footage = link_footage(assets, _read(ledger_path), shared_client())
+        save_json(shared / "footage.json", footage)
     portable = _asset_paths(assets, shared, portable=True)
     save_json(shared / "assets.json", portable)
     return portable
@@ -162,10 +193,11 @@ def render_stage(kind, shared, work, output, *, recovery=None):
 
 def run_stage(stage, shared, work, output, *, kind=None, recovery=None):
     if stage == "prepare":
+        # Story events, then footage linked to them, then scripts that know what can be shown.
         research_stage(shared)
-        scripts = write_stage(shared)
+        ledger_stage(shared)
         assets_stage(shared)
-        return scripts
+        return write_stage(shared)
     if stage == "research":
         return research_stage(shared)
     if stage == "write":

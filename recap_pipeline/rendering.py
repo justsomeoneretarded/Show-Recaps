@@ -26,7 +26,8 @@ from movie_pipeline.timing import DurationSpec
 from .editing import (UsageTracker, analyse_assets, choose_resolution, plan_source_audio,
                       plan_visuals, prefer_sharp_sources, scene_catalogue)
 from .gemini import shared_client
-from .gemini_media import rank_scenes
+from .gemini_media import pick_sentence_shots
+from .sync import segments as sentence_segments, sentences as split_sentences, word_times
 from .models import voice_speed_value
 from .models import validate_script_scope
 from .thumbnails import build_thumbnails
@@ -151,6 +152,40 @@ class _DeliverySpeaker:
         if self.model is not None:
             self.model.close()
             self.model = None
+
+
+def _paragraph_events(section, index):
+    groups = section.get("paragraph_event_ids")
+    if isinstance(groups, list) and index < len(groups) and isinstance(groups[index], list):
+        return [str(value) for value in groups[index]]
+    return [str(value) for value in section.get("event_ids") or []]
+
+
+def _sentence_shots(gemini, section, text, aligned, seconds, pool, usage, episode_ids, events, context):
+    """One shot per narrated sentence, cut so each key word lands on its new shot.
+
+    Gemini picks shots and the key word for every sentence in one request per
+    paragraph; without it, scenes linked to the paragraph's events still lead.
+    """
+    sentences = split_sentences(text)
+    picks = pick_sentence_shots(gemini, sentences, scene_catalogue(
+        section, text, pool, usage, episode_ids=episode_ids), context=context)
+    words = word_times(text, aligned, seconds)
+    plan = sentence_segments(text, words, seconds, {i: p["key_word"] for i, p in picks.items() if p.get("key_word")})
+    chosen, cuts = [], []
+    for segment in plan:
+        span = segment["end"] - segment["start"]
+        keys = (picks.get(segment["sentence"]) or {}).get("keys") or []
+        shots = plan_visuals(section, segment["text"], span, pool, usage, episode_ids=episode_ids,
+                             preferred=keys, events=events)
+        chosen.extend(shots)
+        cuts.append({"start": round(segment["start"], 3), "end": round(segment["end"], 3),
+                     "sentence": segment["sentence"],
+                     "key_word": (picks.get(segment["sentence"]) or {}).get("key_word", ""),
+                     "linked_event": any(shot.get("event_id") in events for shot in shots)})
+    if not chosen:
+        raise PipelineError("No scoped visual plan covers the complete recap paragraph.")
+    return chosen, cuts
 
 
 def _make_recovery(spec, work):
@@ -330,11 +365,10 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
                     if Path(audio).resolve() != retained.resolve():
                         shutil.copyfile(audio, retained)
                     current_episodes = _paragraph_episodes(section, paragraph_index, episodes)
-                    preferred = rank_scenes(gemini, text, scene_catalogue(
-                        section, text, pool, usage, episode_ids=current_episodes),
-                        context=f"{show_title}: {_chapter_title(section, show_title)}")
-                    chosen = plan_visuals(section, text, duration(retained), pool, usage,
-                                          episode_ids=current_episodes, preferred=preferred)
+                    paragraph_events = _paragraph_events(section, paragraph_index)
+                    chosen, cut_plan = _sentence_shots(
+                        gemini, section, text, aligned, duration(retained), pool, usage, current_episodes,
+                        paragraph_events, f"{show_title}: {_chapter_title(section, show_title)}")
                     if not chosen:
                         raise PipelineError("No scoped visual plan covers the complete recap paragraph.")
                     part_work = work / "parts" / f"{section_index:03}-{paragraph_index:03}"
@@ -346,6 +380,7 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
                                         label if paragraph_index == 0 else None, part_work / "render")
                     seconds = _part_seconds(part)
                     event = {"type": "narration", "section_kind": section["kind"], "section_id": section["id"],
+                             "cuts": cut_plan,
                              "start": clock, "duration": seconds, "text": text, "source_audio": str(retained.resolve()),
                              "delivery": delivery, "pace": pace, "original_speech_seconds": raw_seconds,
                              "season": section.get("season"), "episode_ids": current_episodes, "shots": chosen}
@@ -359,7 +394,8 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
                         recognizer = getattr(recovery, "recognizer", None)
                         analyser = (lambda source: voice.captions(Path(source), recognizer)) if recognizer is not None else None
                         beat = plan_source_audio(section, text, pool, usage,
-                                                 episode_ids=current_episodes, analyser=analyser)
+                                                 episode_ids=current_episodes, analyser=analyser,
+                                                 events=paragraph_events)
                         if beat:
                             pending = {"type": "trailer-audio", "section_kind": section["kind"],
                                 "section_id": section["id"], "start": clock, "duration": beat["duration"],

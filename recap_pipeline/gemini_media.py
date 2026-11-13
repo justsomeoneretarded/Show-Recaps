@@ -233,3 +233,78 @@ def packaging(client, script: dict) -> dict:
     except (GeminiUnavailable, PipelineError):
         return {}
     return {key: " ".join(str(raw.get(key) or "").split()) for key in ("title", "headline", "hook")}
+
+
+LINK_SCHEMA = _object({"links": {"type": "array", "items": _object({
+    "scene": {"type": "integer"}, "event_id": _TEXT, "confidence": _NUMBER})}})
+PICK_SCHEMA = _object({"sentences": {"type": "array", "items": _object({
+    "index": {"type": "integer"}, "keys": _STRINGS, "key_word": _TEXT})}})
+MIN_LINK_CONFIDENCE = 0.6
+
+
+def link_scenes(client, scenes: list[dict], events: list[dict]) -> dict[int, dict]:
+    """Which verified story event (if any) each logged scene shows.
+
+    Events come from the sourced ledger of the clip's own season only, so a link
+    can never move footage across seasons. Returns {scene index: event}.
+    """
+    if client is None or not scenes or not events:
+        return {}
+    by_id = {str(event["id"]): event for event in events}
+    try:
+        raw = client.generate_json(SYSTEM, (
+            "TASK: LINK_SCENES. Each scene below was logged from one official clip of this season. "
+            "For each scene that clearly shows one of the listed story events (same characters doing "
+            "the described action, in the described place), return its event_id and your confidence "
+            "from 0 to 1. Skip scenes that are generic, ambiguous or match nothing. Never guess.\nDATA: "
+            + json.dumps({"scenes": [{"scene": i, "description": s.get("description", "")[:300]}
+                                     for i, s in enumerate(scenes)],
+                          "events": [{"event_id": str(e["id"]), "episode": e.get("episode"),
+                                      "summary": str(e.get("summary", ""))[:300]} for e in events]},
+                         ensure_ascii=False)), LINK_SCHEMA)
+    except (GeminiUnavailable, PipelineError):
+        return {}
+    result = {}
+    for row in raw.get("links", []) if isinstance(raw.get("links"), list) else []:
+        if not isinstance(row, dict):
+            continue
+        index, event = row.get("scene"), by_id.get(str(row.get("event_id")))
+        if (type(index) is int and 0 <= index < len(scenes) and event is not None
+                and _number(row.get("confidence"), 0) >= MIN_LINK_CONFIDENCE and index not in result):
+            result[index] = event
+    return result
+
+
+def pick_sentence_shots(client, sentences: list[str], catalogue: list[dict], *, context: str = "") -> dict[int, dict]:
+    """For each narrated sentence: ranked in-scope scene keys and the key word to cut on."""
+    if client is None or not sentences:
+        return {}
+    rows = catalogue[:MAX_CATALOGUE]
+    allowed = {row["key"] for row in rows}
+    try:
+        raw = client.generate_json(SYSTEM, (
+            "TASK: PICK_SHOTS_PER_SENTENCE. A narrator reads these sentences over footage, one shot per "
+            "sentence. For each sentence return up to 4 scene keys from the catalogue, best first, that "
+            "show what the sentence describes (same characters, action, place or mood; prefer scenes "
+            "linked to the same story event, high quality, no watermark, and different scenes for "
+            "different sentences), plus key_word: the single word from that sentence (copied exactly) "
+            "whose action should be on screen as it is spoken. Use only catalogue keys; return an empty "
+            "list when nothing fits.\nDATA: " + json.dumps(
+                {"context": context, "sentences": [{"index": i, "text": s} for i, s in enumerate(sentences)],
+                 "catalogue": [{"key": r["key"], "description": r["description"][:220],
+                                "event": r.get("event", "")[:160], "seconds": round(r["seconds"], 1),
+                                "quality": r.get("quality", 5), "watermark": r.get("watermark", False)}
+                               for r in rows]}, ensure_ascii=False)), PICK_SCHEMA)
+    except (GeminiUnavailable, PipelineError):
+        return {}
+    result = {}
+    for row in raw.get("sentences", []) if isinstance(raw.get("sentences"), list) else []:
+        if not isinstance(row, dict) or type(row.get("index")) is not int or not 0 <= row["index"] < len(sentences):
+            continue
+        keys = [k for k in dict.fromkeys(row.get("keys") or []) if isinstance(k, str) and k in allowed][:4]
+        word = str(row.get("key_word") or "").strip()
+        words = {re.sub(r"[^a-z0-9]", "", w.casefold()) for w in sentences[row["index"]].split()}
+        if re.sub(r"[^a-z0-9]", "", word.casefold()) not in words:
+            word = ""
+        result[row["index"]] = {"keys": keys, "key_word": word}
+    return result

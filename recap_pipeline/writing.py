@@ -13,7 +13,7 @@ from movie_pipeline.core import PipelineError, key, save_json
 from recap_pipeline.gemini import GeminiClient, GeminiUnavailable, configured_key
 from recap_pipeline.models import MAX_VIDEO_MINUTES, narration_within_scope, voice_speed_value
 
-POLICY_VERSION = 8
+POLICY_VERSION = 9
 WORDS_PER_SECOND = 2.7  # measured 2.9 in production; lower keeps the estimate long
 FIXED_SECONDS = 20.0  # end screen, holds and title beats
 MAX_EPISODES_PER_BATCH = 6
@@ -496,7 +496,8 @@ def _fit_budget(sections, max_words, event_map):
 
 
 def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previous,
-                   prior_events=None, research_quality=None, runtime_share=None, max_share=None):
+                   prior_events=None, research_quality=None, runtime_share=None, max_share=None,
+                   footage=None):
     focus_ids = [e["id"] for e in events]
     # Carry source-backed context so cross-season transitions can cite the earlier arc.
     events = list({e["id"]: e for e in [*(prior_events or []), *events]}.values())
@@ -512,6 +513,8 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
                "research_quality": research_quality or {},
                "section_runtime_preference_minutes": runtime_share,
                "section_max_minutes": max_share, "video_max_minutes": MAX_VIDEO_MINUTES,
+               # Seconds of real footage showing each event: these can be narrated visually.
+               "footage_seconds": {e["id"]: footage[e["id"]] for e in events if footage and e["id"] in footage},
                "section_target_words": (int(runtime_share * 60 * WORDS_PER_SECOND
                                             * voice_speed_value(_spec_value(spec, "voice_speed", "1.0")))
                                         if runtime_share else None)}
@@ -530,6 +533,9 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
              "section_runtime_preference_minutes is this section's approximate share, already "
              "allocated across the story and ending; do not spend the whole video target here. "
              "Both values are SOFT guidance, never requirements; "
+            "footage_seconds lists events the viewer will SEE on screen: give each a concrete, vivid sentence "
+            "about the action shown, one sentence per visible action so the edit can cut on it; keep events "
+            "without footage shorter. Visual wording must still be supported by the cited evidence. "
             "When section_target_words is a number the viewer asked for that length: aim for it within "
             "25 percent by covering MORE of the supplied events and their causes, motives and consequences "
             "in fuller detail, one cited paragraph per turn of the story. Reaching it must never involve "
@@ -594,7 +600,7 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
     return result
 
 
-def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None):
+def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None, footage=None):
     """Write a detailed previous-season recap or the linked story of all earlier seasons."""
     if kind not in {"season", "series"}:
         raise PipelineError("Recap kind must be season or series.")
@@ -677,7 +683,7 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None):
             result = _write_section(writer, cache_dir, kind, "story", season, batch, spec, previous,
                                     previous_events, bundle.get("research_quality", {}),
                                     runtime_share=share(len(batch), season),
-                                    max_share=ceiling(len(batch), season))
+                                    max_share=ceiling(len(batch), season), footage=footage)
             if result["paragraphs"]:
                 section = _section(f"story-s{season}-{index + 1}", "story", result["title"], season,
                                    result["paragraphs"], event_map)
@@ -701,7 +707,8 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None):
         for index, batch in enumerate(_batch(ending_events)):
             result = _write_section(writer, cache_dir, kind, "ending", upcoming - 1, batch, spec, previous,
                                     research_quality=bundle.get("research_quality", {}),
-                                    runtime_share=share(len(batch)), max_share=ceiling(len(batch)))
+                                    runtime_share=share(len(batch)), max_share=ceiling(len(batch)),
+                                    footage=footage)
             if result["paragraphs"]:
                 sections.append(_section(f"where-we-left-off-{index + 1}", "ending", "Where we left off",
                                          upcoming - 1, result["paragraphs"], event_map))

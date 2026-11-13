@@ -18,7 +18,8 @@ from pathlib import Path
 from movie_pipeline.core import PipelineError
 
 MAX_ANALYSED_SOURCES = 80
-MAX_NATIVE_SOURCES = 4
+MAX_NATIVE_SOURCES = 8
+MAX_NATIVE_BEATS = 4
 DIVERSITY_SECONDS = 12.0  # one point of score lost per 12 s already used from a clip
 SHARP_SHARE = 0.66
 MOTIONS = ("zoom_in", "zoom_out")
@@ -256,7 +257,7 @@ def _quality(shot):
         - (2 if shot.get("dark") else 0)
 
 
-def _visual_options(rows, paragraph, seconds, usage, exact, preferred=None, *, reuse=False):
+def _visual_options(rows, paragraph, seconds, usage, exact, preferred=None, *, reuse=False, events=None):
     """Candidate shots for one beat. ``reuse`` allows already used footage, least used first."""
     result = []
     text = paragraph.get("text", "") if isinstance(paragraph, dict) else paragraph
@@ -283,6 +284,9 @@ def _visual_options(rows, paragraph, seconds, usage, exact, preferred=None, *, r
                 continue  # A fast or unstable source becomes a gentle moving frame instead.
             key = _shot_key(source, shot)
             bonus = (40 - 4 * ranks[key]) if key in ranks else 0
+            # A scene linked to the very story event being narrated is the strongest match.
+            if events and shot.get("event_id") in events:
+                bonus += 30
             description = str(shot.get("description", "")) + " " + str(shot.get("text", ""))
             base = (100 * exact + 20 + match + _relevance(text, description) + bonus + _quality(shot)
                     - min(max(0.0, _number(shot.get("motion"))), 100) / 50
@@ -293,18 +297,20 @@ def _visual_options(rows, paragraph, seconds, usage, exact, preferred=None, *, r
                 overlap = 1 - usage.fresh(source, shot["start"], shot["end"] - shot["start"])
                 score = base - 30 * overlap - (8 if usage.last_source == source else 0)
                 if shot["end"] - shot["start"] + .001 >= seconds:
-                    result.append((score, {"row": row, "start": shot["start"], "still": False, "image": False}))
+                    result.append((score, {"row": row, "start": shot["start"], "still": False, "image": False,
+                                           "event_id": shot.get("event_id")}))
                 else:
                     # Too short to run for the whole beat: a gently moving frame from its middle.
                     middle = (shot["start"] + shot["end"]) / 2
                     result.append((score - 5 - 3 * usage.image_uses[source + f"@{middle:.3f}"],
                                    {"row": row, "start": middle, "still": True, "image": False,
-                                    "frame_key": source + f"@{middle:.3f}"}))
+                                    "frame_key": source + f"@{middle:.3f}", "event_id": shot.get("event_id")}))
                 continue
             for start, end in _free_windows(source, shot["start"], shot["end"], usage):
                 if end - start + .001 < seconds:
                     continue
-                result.append((base, {"row": row, "start": start, "still": False, "image": False}))
+                result.append((base, {"row": row, "start": start, "still": False, "image": False,
+                                      "event_id": shot.get("event_id")}))
         # A short coherent shot can provide one gently moving frame. Never freeze
         # an arbitrary trailer end or loop its last shot to fill narration.
         if not reuse and not any(value[1]["row"] is row for value in result):
@@ -332,6 +338,7 @@ def scene_catalogue(section: dict, paragraph, assets: dict, usage: UsageTracker,
             if not shot.get("description"):
                 continue
             catalogue.append({"key": _shot_key(source, shot), "description": str(shot["description"]),
+                              "event": str(shot.get("event_summary") or ""),
                               "seconds": shot["end"] - shot["start"], "quality": shot.get("quality", 5),
                               "watermark": bool(shot.get("watermark")),
                               "freshness": usage.fresh(source, shot["start"], shot["end"] - shot["start"])})
@@ -341,7 +348,7 @@ def scene_catalogue(section: dict, paragraph, assets: dict, usage: UsageTracker,
 
 
 def plan_visuals(section: dict, paragraph, seconds: float, assets: dict, usage: UsageTracker,
-                 *, episode_ids=None, preferred=None) -> list[dict]:
+                 *, episode_ids=None, preferred=None, events=None) -> list[dict]:
     """Fill all narration with real footage, normally coherent 6–10 second cuts.
 
     Order of preference: this paragraph's episode, fresh same-season footage,
@@ -358,18 +365,18 @@ def plan_visuals(section: dict, paragraph, seconds: float, assets: dict, usage: 
     for index in range(count):
         wanted = seconds - sum(shot["duration"] for shot in plan) if index == count - 1 else beat_seconds
         borrowed = False
-        options = _visual_options(exact, paragraph, wanted, usage, True, preferred)
+        options = _visual_options(exact, paragraph, wanted, usage, True, preferred, events=events)
         if not options:
-            options = _visual_options(generic, paragraph, wanted, usage, False, preferred)
+            options = _visual_options(generic, paragraph, wanted, usage, False, preferred, events=events)
         if not options and others:
-            options = _visual_options(others, paragraph, wanted, usage, False, preferred)
+            options = _visual_options(others, paragraph, wanted, usage, False, preferred, events=events)
             borrowed = bool(options)
         if not options:
-            options = _visual_options(exact + generic, paragraph, wanted, usage, False, preferred, reuse=True)
+            options = _visual_options(exact + generic, paragraph, wanted, usage, False, preferred, reuse=True, events=events)
             if options and season is not None:
                 usage.warn(f"Season {season}: fresh footage ran out, so some shots are reused.")
         if not options and others:
-            options = _visual_options(others, paragraph, wanted, usage, False, preferred, reuse=True)
+            options = _visual_options(others, paragraph, wanted, usage, False, preferred, reuse=True, events=events)
             borrowed = bool(options)
         if not options:
             raise PipelineError("No footage or imagery is available for this recap; "
@@ -389,7 +396,7 @@ def plan_visuals(section: dict, paragraph, seconds: float, assets: dict, usage: 
                 "season": _integer(row.get("season")) if (borrowed or season is None) else season,
                 "episode_id": row_ids[0] if len(row_ids) == 1 else None, "episode_ids": row_ids,
                 "scope": row.get("scope", "season"), "illustrative": bool(row.get("illustrative")),
-                "source_url": row.get("source_url", ""),
+                "source_url": row.get("source_url", ""), "event_id": chosen.get("event_id"),
                 "selection": "current-episode" if row_ids else
                              "other-season-fallback" if borrowed else
                              "orientation-footage" if season is None else "same-season-generic"}
@@ -468,24 +475,36 @@ def _phrases(cues):
 
 
 def plan_source_audio(section: dict, paragraph, assets: dict, usage: UsageTracker, *,
-                      episode_ids=None, analyser=None) -> dict | None:
+                      episode_ids=None, analyser=None, events=None) -> dict | None:
     """Optional complete utterances, restricted to verified current-episode clips.
 
     At most four unique sources receive ASR in one recap. No recognizer, complete
     phrase, fresh coherent scene, or lexical connection means no native insert.
     """
-    season, ids, exact, _, _ = _pool(section, paragraph, assets, usage, episode_ids)
+    season, ids, exact, generic, _ = _pool(section, paragraph, assets, usage, episode_ids)
     section_id = str(section.get("id", ""))
     if (season is None or len(ids) != 1 or not callable(analyser)
             or section.get("kind") not in {"story", "ending"}
-            or section_id in usage.native_sections):
+            or section_id in usage.native_sections or len(usage.native_sections) >= MAX_NATIVE_BEATS):
         return None
     query = paragraph.get("text", "") if isinstance(paragraph, dict) else str(paragraph)
+    events = set(events or [])
+    candidates = []
     for row in exact:
-        if row.get("kind") != "video" or _episode_ids(row.get("episode_ids")) != ids:
+        if row.get("kind") == "video" and _episode_ids(row.get("episode_ids")) == ids:
+            shots = usage.shots.get(str(row["path"]), _clean_shots(row.get("shots"), _number(row.get("duration"))))
+            candidates.append((row, shots, False))
+    # Season clips whose scenes Gemini linked to this paragraph's episode can speak too,
+    # but only inside those linked scenes.
+    for row in generic:
+        if row.get("kind") != "video":
             continue
+        shots = [shot for shot in usage.shots.get(str(row["path"]), _clean_shots(row.get("shots"), _number(row.get("duration"))))
+                 if str(shot.get("episode_id") or "") == ids[0]]
+        if shots:
+            candidates.append((row, shots, True))
+    for row, shots, linked in candidates:
         source = str(row["path"])
-        shots = usage.shots.get(source, _clean_shots(row.get("shots"), _number(row.get("duration"))))
         if not shots:
             continue
         if source not in usage.native_sources:
@@ -500,7 +519,10 @@ def plan_source_audio(section: dict, paragraph, assets: dict, usage: UsageTracke
         for group in _phrases(usage.native_cues.get(source, [])):
             text = " ".join(cue["text"] for cue in group)
             shared = _terms(query) & _terms(text)
-            if len(shared) < 2 or len(shared) / max(1, len(_terms(text))) < .25:
+            on_event = any(shot.get("event_id") in events for shot in shots
+                           if shot["start"] <= group[0]["start"] and shot["end"] >= group[-1]["end"])
+            # Words in common, or a scene linked to the very event being narrated.
+            if not on_event and (len(shared) < 2 or len(shared) / max(1, len(_terms(text))) < .25):
                 continue
             start, end = group[0]["start"] - .14, group[-1]["end"] + .20
             if start < 0 or end > _number(row.get("duration")) or not 3 <= end - start <= 12:
@@ -509,7 +531,7 @@ def plan_source_audio(section: dict, paragraph, assets: dict, usage: UsageTracke
                 continue
             if usage.fresh(source, start, end - start) < .98:
                 continue
-            row_ids = _episode_ids(row.get("episode_ids"))
+            row_ids = list(ids) if linked else _episode_ids(row.get("episode_ids"))
             clip = {"source": source, "path": source, "start": start, "end": end, "duration": end - start,
                     "text": text, "cues": [dict(cue) for cue in group], "season": season,
                     "episode_ids": row_ids, "episode_id": row_ids[0] if len(row_ids) == 1 else None,

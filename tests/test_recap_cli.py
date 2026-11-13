@@ -34,7 +34,7 @@ def _script(kind):
 
 @pytest.fixture
 def services(monkeypatch, tmp_path):
-    events, renders = [], []
+    events, renders, footages = [], [], []
     for name, value in {"SHOW_TITLE": "Example", "SHOW_YEAR": "2020", "UPCOMING_SEASON": "3",
                         "RECAP_BRIEF": "Calm prose.", "NARRATOR": "Warguy", "TTS_MODEL": "original",
                         "TRY_4K": "true", "SEASON_MINUTES": "Auto", "SERIES_MINUTES": "Auto"}.items():
@@ -55,8 +55,9 @@ def services(monkeypatch, tmp_path):
         events.append(("ledger",))
         return {"events": [{"id": "v1"}, {"id": "v2"}]}
 
-    def write(kind, spec, bundle, ledger, cache, writer):
+    def write(kind, spec, bundle, ledger, cache, writer, footage=None):
         events.append(("write", kind))
+        footages.append(footage)
         return _script(kind)
 
     def collect(bundle, spec, cache):
@@ -77,20 +78,29 @@ def services(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "recap_pipeline.writing",
                         SimpleNamespace(RecapWriter=Writer, build_ledger=ledger, write_recap=write,
                                         apply_packaging=lambda script, client: script))
-    monkeypatch.setitem(sys.modules, "recap_pipeline.assets", SimpleNamespace(collect_assets=collect))
+    def link(collected, ledger, client):
+        events.append(("link",))
+        return {"v2": 12.5}
+
+    monkeypatch.setitem(sys.modules, "recap_pipeline.assets",
+                        SimpleNamespace(collect_assets=collect, link_footage=link))
     monkeypatch.setitem(sys.modules, "recap_pipeline.rendering", SimpleNamespace(render_recap=render))
-    return SimpleNamespace(events=events, renders=renders, shared=tmp_path / "shared",
+    return SimpleNamespace(events=events, renders=renders, footages=footages, shared=tmp_path / "shared",
                            work=tmp_path / "render", output=tmp_path / "output")
 
 
 def test_prepare_researches_once_writes_exactly_two_scripts_and_collects_once(services):
     result = cli.run_stage("prepare", services.shared, services.work, services.output)
     assert set(result) == {"season", "series"}
+    # Story events first, then footage linked to them, then scripts that know what can be shown.
     assert [event[0] for event in services.events] == [
-        "research", "writer", "ledger", "write", "write", "unload", "assets"]
+        "research", "writer", "ledger", "unload", "assets", "link",
+        "writer", "ledger", "write", "write", "unload"]
+    assert services.footages == [{"v2": 12.5}, {"v2": 12.5}]
     assert [event[1] for event in services.events if event[0] == "write"] == ["season", "series"]
     assert {path.name for path in services.shared.glob("*.json")} == {
-        "spec.json", "research.json", "story-ledger.json", "season-script.json", "series-script.json", "assets.json"}
+        "spec.json", "research.json", "story-ledger.json", "season-script.json", "series-script.json", "assets.json",
+        "footage.json"}
     assets = json.loads((services.shared / "assets.json").read_text())
     assert assets["seasons"]["1"][0]["path"] == "asset-cache/still.jpg"
     assert "TELEGRAM" not in (services.shared / "spec.json").read_text()
@@ -165,7 +175,7 @@ def test_collector_cannot_export_an_outside_path_or_symlink(services, tmp_path, 
 def test_writer_always_unloads_when_generation_or_scope_fails(services, monkeypatch):
     cli.research_stage(services.shared)
     module = sys.modules["recap_pipeline.writing"]
-    monkeypatch.setattr(module, "write_recap", lambda *args: {})
+    monkeypatch.setattr(module, "write_recap", lambda *args, **kwargs: {})
     with pytest.raises(PipelineError):
         cli.write_stage(services.shared)
     assert services.events[-1] == ("unload",)
@@ -253,7 +263,7 @@ def test_before_season_two_only_one_recap_is_written_and_rendered(services, monk
     sys.modules["recap_pipeline.research"].research_show = lambda spec, cache: (research(spec, cache), bundle())[1]
     write = sys.modules["recap_pipeline.writing"].write_recap
     sys.modules["recap_pipeline.writing"].write_recap = (
-        lambda kind, *args: (write(kind, *args), season_one(kind))[1])
+        lambda kind, *args, **kwargs: (write(kind, *args, **kwargs), season_one(kind))[1])
     assert set(cli.run_stage("prepare", services.shared, services.work, services.output)) == {"season"}
     assert [event[1] for event in services.events if event[0] == "write"] == ["season"]
     assert not (services.shared / "series-script.json").exists()

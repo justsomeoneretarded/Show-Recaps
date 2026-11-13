@@ -758,3 +758,41 @@ def collect_assets(bundle: dict, spec, cache_dir: Path) -> dict:
         raise PipelineError("No footage or imagery could be downloaded for any covered season. "
                             "Add or refresh the YOUTUBE_COOKIES secret and run again; no blank-plate video is made.")
     return result
+
+
+def link_footage(collected: dict, ledger: dict, client=None) -> dict[str, float]:
+    """Tag each logged scene with the sourced story event it shows.
+
+    Links stay inside the clip's own season. Returns seconds of linked footage per
+    event id, which tells the writer which moments can be shown on screen.
+    """
+    from .gemini_media import link_scenes
+    by_season = {}
+    for event in ledger.get("events", []) if isinstance(ledger, dict) else []:
+        if isinstance(event, dict) and event.get("id") and event.get("season") is not None:
+            by_season.setdefault(int(event["season"]), []).append(event)
+    footage: dict[str, float] = {}
+    linked = scenes = 0
+    for key, rows in (collected.get("seasons") or {}).items():
+        events = by_season.get(int(key), [])
+        for row in rows:
+            shots = row.get("shots") if row.get("kind") == "video" else None
+            if not isinstance(shots, list) or not any(s.get("description") for s in shots):
+                continue
+            already = {i: s for i, s in enumerate(shots) if s.get("event_id")}
+            links = already and {i: {"id": s["event_id"], "episode_id": s.get("episode_id"),
+                                     "summary": s.get("event_summary", "")} for i, s in already.items()}
+            if not links:
+                links = link_scenes(client, shots, events)
+            scenes += len(shots)
+            for index, event in links.items():
+                shot = shots[index]
+                shot.update(event_id=str(event["id"]), episode_id=str(event.get("episode_id") or ""),
+                            event_summary=str(event.get("summary", ""))[:300])
+                footage[str(event["id"])] = round(footage.get(str(event["id"]), 0.0)
+                                                  + float(shot["end"]) - float(shot["start"]), 2)
+                linked += 1
+    if scenes:
+        collected.setdefault("warnings", []).append(
+            f"Gemini linked {linked} of {scenes} logged scenes to {len(footage)} sourced story events.")
+    return footage
