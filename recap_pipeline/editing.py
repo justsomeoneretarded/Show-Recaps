@@ -22,6 +22,8 @@ MAX_NATIVE_SOURCES = 8
 MAX_NATIVE_BEATS = 4
 DIVERSITY_SECONDS = 12.0  # one point of score lost per 12 s already used from a clip
 SHARP_SHARE = 0.66
+MIN_SHARP_HEIGHT = 700
+PROFANITY = re.compile(r"\b(?:fuck\w*|motherfuck\w*|shit\w*|cunt\w*|bitch\w*|asshole\w*|nigg\w*)\b", re.I)
 MOTIONS = ("zoom_in", "zoom_out")
 STOPWORDS = {"the", "and", "that", "this", "with", "from", "into", "their", "they", "them",
              "then", "have", "has", "was", "were", "are", "for", "but", "not", "his", "her",
@@ -518,6 +520,8 @@ def plan_source_audio(section: dict, paragraph, assets: dict, usage: UsageTracke
                 usage.warn(f"Season {season}: optional source-audio analysis was skipped ({type(exc).__name__}).")
         for group in _phrases(usage.native_cues.get(source, [])):
             text = " ".join(cue["text"] for cue in group)
+            if PROFANITY.search(text):
+                continue  # strong language risks the video's advertiser suitability
             shared = _terms(query) & _terms(text)
             on_event = any(shot.get("event_id") in events for shot in shots
                            if shot["start"] <= group[0]["start"] and shot["end"] >= group[-1]["end"])
@@ -554,7 +558,9 @@ def prefer_sharp_sources(assets: dict) -> tuple[dict, list[str]]:
     heights = sorted((int(_number(row.get("height"))) for row in videos), reverse=True)
     if len(heights) < 4:
         return assets, []
-    floor = heights[2] * SHARP_SHARE
+    # Only clearly low-resolution uploads go: never a 720p-or-better clip just because
+    # a few 4K clips exist (that left one run with only three clips to cut from).
+    floor = min(heights[2] * SHARP_SHARE, MIN_SHARP_HEIGHT)
     kept = {key: [row for row in rows if not (isinstance(row, dict) and row.get("kind") == "video"
                                                and _number(row.get("height")) < floor)]
             for key, rows in seasons.items()}

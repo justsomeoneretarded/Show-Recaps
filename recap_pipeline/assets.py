@@ -630,7 +630,7 @@ def _letterbox_crop(path: Path) -> str | None:
         try:
             result = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-ss", f"{seconds * fraction:.2f}", "-i", str(path), "-t", "3",
-                 "-vf", "cropdetect=limit=24:round=2:reset=0", "-f", "null", "-"],
+                 "-vf", "cropdetect=limit=40:round=2:reset=0", "-f", "null", "-"],
                 capture_output=True, text=True, timeout=120, check=False)
         except (OSError, subprocess.TimeoutExpired):
             return None

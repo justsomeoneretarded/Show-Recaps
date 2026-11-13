@@ -151,3 +151,29 @@ def test_writer_is_told_which_events_have_footage(tmp_path):
     drafts = [data for task, data, _ in model.calls if "DRAFT_RECAP" in task]
     assert any(data["footage_seconds"] == {event: 14.0} for data in drafts)
     assert any("footage_seconds lists events the viewer will SEE" in task for task, _, _ in model.calls)
+
+
+def test_a_few_4k_clips_never_push_out_the_1080p_ones():
+    from recap_pipeline.editing import prefer_sharp_sources
+    rows = [dict(_clip(f"uhd{i}", []), height=2160) for i in range(3)]
+    rows += [dict(_clip(f"hd{i}", []), height=1080) for i in range(6)] + [dict(_clip("sd", []), height=360)]
+    kept, _ = prefer_sharp_sources({"seasons": {"1": rows}})
+    assert len(kept["seasons"]["1"]) == 9 and all(r["height"] >= 1080 for r in kept["seasons"]["1"])
+
+
+def test_profane_dialogue_is_never_played():
+    clip = _clip("a", [{"start": 0, "end": 20, "description": "Reece", "episode_id": "ep8", "event_id": "e8"}], season=2)
+    usage = UsageTracker(3, episode_seasons={"ep8": 2})
+    cues = [{"start": 4.0, "end": 8.0, "text": "Cleaning up all those motherfuckers that took them."}]
+    section = {"id": "end", "kind": "ending", "season": 2, "episode_ids": ["ep8"]}
+    assert plan_source_audio(section, "Reece cleans up.", {"seasons": {"2": [clip]}}, usage,
+                             episode_ids=["ep8"], analyser=lambda path: cues, events=["e8"]) is None
+
+
+@pytest.mark.skipif(not __import__("shutil").which("ffmpeg"), reason="FFmpeg required")
+def test_dark_grey_letterbox_bars_are_detected(tmp_path):
+    from movie_pipeline.core import ffmpeg
+    clip = tmp_path / "grey.mp4"
+    ffmpeg("-f", "lavfi", "-i", "testsrc2=size=640x288:rate=24:duration=12",
+           "-vf", "pad=640:360:0:36:0x1c1c14", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", clip)
+    assert assets._letterbox_crop(clip)
