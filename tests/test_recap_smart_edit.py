@@ -191,3 +191,13 @@ def test_unlogged_scenes_with_captions_or_subscribe_screens_are_dropped(tmp_path
                            text_reader=lambda path, second: texts.get(second, ""))["/fan.mp4"]
     assert [s["start"] for s in shots] == [20, 30]
     assert any("on-screen text" in w for w in usage.warnings)
+
+
+@pytest.mark.parametrize("text", ["15 DECEMBER", "[panting]", "NOW STREAMING", "December 2023"])
+def test_release_dates_sound_captions_and_promo_cards_are_dropped(tmp_path, text):
+    from recap_pipeline.editing import analyse_assets
+    clip = {"kind": "video", "path": "/c.mp4", "season": 2, "episode_ids": [], "scope": "season",
+            "duration": 30.0, "width": 1920, "height": 1080, "shots": [{"start": 1, "end": 9}, {"start": 10, "end": 18}]}
+    shots = analyse_assets({"seasons": {"2": [clip]}}, tmp_path, UsageTracker(3, episode_seasons={}),
+                           text_reader=lambda path, second: text if second == 5.0 else "")["/c.mp4"]
+    assert [s["start"] for s in shots] == [10]

@@ -185,6 +185,12 @@ def _clean_shots(rows, length):
 
 
 CAPTION_WORDS = 3  # three or more readable words in a frame means burned-in text
+# Release-date cards ("15 DECEMBER") and closed-caption sound tags ("[panting]").
+RELEASE_DATE = re.compile(
+    r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b"
+    r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b"
+    r"|\b(?:january|february|april|june|july|august|september|october|november|december)\b|\b20\d\d\b", re.I)
+SOUND_CAPTION = re.compile(r"\[[a-z ,\-]{3,30}\]|♪", re.I)
 
 
 def _frame_text(path, seconds):
@@ -202,7 +208,7 @@ def _without_text(path, shots, reader):
     Gemini flags these when it logs a clip; this covers clips it could not log.
     """
     try:
-        from movie_pipeline.shots import PROMO_TEXT
+        from movie_pipeline.shots import CARD_TEXT, PROMO_TEXT
     except ImportError:  # without the optional video tools there is no OCR to apply
         return list(shots)
     kept = []
@@ -211,7 +217,8 @@ def _without_text(path, shots, reader):
             kept.append(shot)
             continue
         text = reader(path, (shot["start"] + shot["end"]) / 2)
-        if PROMO_TEXT.search(text) or len(re.findall(r"\b[A-Za-z]{3,}\b", text)) >= CAPTION_WORDS:
+        if (PROMO_TEXT.search(text) or CARD_TEXT.search(text) or RELEASE_DATE.search(text)
+                or SOUND_CAPTION.search(text) or len(re.findall(r"\b[A-Za-z]{3,}\b", text)) >= CAPTION_WORDS):
             continue
         kept.append(shot)
     return kept
