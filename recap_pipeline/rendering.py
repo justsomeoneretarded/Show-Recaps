@@ -361,8 +361,10 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
                     raw_seconds = duration(audio)
                     pace = delivery_speed(narration_rate(theme), delivery,
                                           words=len(text.split()), seconds=raw_seconds)
-                    # The viewer-chosen voice-over speed multiplies the natural delivery pace.
-                    pace = round(min(1.6, max(0.75, pace * voice_speed)), 3)
+                    # Automatic pacing may tighten a slow take but never slows the narrator below
+                    # their natural reading; the chosen voice-over speed then applies on top, so
+                    # 1.2 is audibly 20% faster than the natural voice.
+                    pace = round(min(1.6, max(0.75, max(1.0, pace) * voice_speed)), 3)
                     audio = voice.paced_take(Path(audio), pace)
                     aligned = [{**cue, "start": cue["start"] / pace, "end": cue["end"] / pace} for cue in aligned]
                     # Save a unique complete verified recording for the final review.

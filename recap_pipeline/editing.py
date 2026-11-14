@@ -20,6 +20,7 @@ from movie_pipeline.core import PipelineError
 MAX_ANALYSED_SOURCES = 80
 MAX_NATIVE_SOURCES = 8
 MAX_NATIVE_BEATS = 4
+MIN_PIECE = 1.5  # seconds: the shortest shot a beat may be cut into
 SEMANTIC_WEIGHT = 14.0  # points per standard deviation of picture-to-sentence match
 DIVERSITY_SECONDS = 12.0  # one point of score lost per 12 s already used from a clip
 SHARP_SHARE = 0.66
@@ -437,29 +438,47 @@ def plan_visuals(section: dict, paragraph, seconds: float, assets: dict, usage: 
     if seconds <= 0:
         raise PipelineError("A recap paragraph must have a positive measured duration.")
     season, ids, exact, generic, others = _pool(section, paragraph, assets, usage, episode_ids)
-    count = max(1, math.ceil(seconds / 10.0))
-    beat_seconds = seconds / count
+    # (rows, exact episode, reuse used footage, borrowed from another season), best first.
+    tiers = [(exact, True, False, False), (generic, False, False, False), (others, False, False, True),
+             (exact + generic, False, True, False), (others, False, True, True)]
     plan = []
-    for index in range(count):
-        wanted = seconds - sum(shot["duration"] for shot in plan) if index == count - 1 else beat_seconds
-        borrowed = False
-        options = _visual_options(exact, paragraph, wanted, usage, True, preferred, events=events)
-        if not options:
-            options = _visual_options(generic, paragraph, wanted, usage, False, preferred, events=events)
-        if not options and others:
-            options = _visual_options(others, paragraph, wanted, usage, False, preferred, events=events)
-            borrowed = bool(options)
-        if not options:
-            options = _visual_options(exact + generic, paragraph, wanted, usage, False, preferred, reuse=True, events=events)
-            if options and season is not None:
-                usage.warn(f"Season {season}: fresh footage ran out, so some shots are reused.")
-        if not options and others:
-            options = _visual_options(others, paragraph, wanted, usage, False, preferred, reuse=True, events=events)
-            borrowed = bool(options)
-        if not options:
+    remaining = seconds
+    while remaining > 0.05:
+        pieces = max(1, math.ceil(remaining / 10.0))
+        target = remaining if pieces == 1 else remaining / pieces
+        # Moving footage always beats a frozen frame: when no single shot is long enough,
+        # the beat becomes a quicker cut of shorter moving shots, fresh before reused.
+        sizes = [target] + [size for size in (7.0, 5.0, 4.0, 3.0, 2.0)
+                            if size < target - 0.25 and remaining - size >= MIN_PIECE]
+        picked = None
+        for size in sizes:
+            for rows, is_exact, reuse, from_other in tiers:
+                if not rows:
+                    continue
+                moving = [option for option in _visual_options(rows, paragraph, size, usage, is_exact, preferred,
+                                                               reuse=reuse, events=events)
+                          if not option[1]["still"]]
+                if moving:
+                    picked = (size, max(moving, key=lambda item: item[0]), reuse, from_other)
+                    break
+            if picked:
+                break
+        if picked is None:
+            # No moving footage of even two seconds is left anywhere in scope.
+            for rows, is_exact, reuse, from_other in tiers:
+                options = _visual_options(rows, paragraph, target, usage, is_exact, preferred,
+                                          reuse=reuse, events=events) if rows else []
+                if options:
+                    picked = (target, max(options, key=lambda item: item[0]), reuse, from_other)
+                    usage.warn(f"Season {season}: moving footage ran out; a moving still covers part of the narration.")
+                    break
+        if picked is None:
             raise PipelineError("No footage or imagery is available for this recap; "
                                 "no blank plate is used. Add or refresh YOUTUBE_COOKIES and run again.")
-        _, chosen = max(options, key=lambda item: item[0])
+        wanted, (_, chosen), reused, borrowed = picked
+        if reused and season is not None:
+            usage.warn(f"Season {season}: fresh footage ran out, so some shots are reused.")
+        remaining -= wanted
         row = chosen["row"]
         borrowed = borrowed and season is not None
         if borrowed:

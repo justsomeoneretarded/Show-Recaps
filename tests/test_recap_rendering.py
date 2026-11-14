@@ -384,6 +384,7 @@ def test_chosen_voice_speed_quickens_every_narration_paragraph(tmp_path, monkeyp
         results[speed] = (report, [e for e in events if e["type"] == "narration"])
     assert results["1.3"][0]["voice_speed"] == 1.3 and results["1.0"][0]["voice_speed"] == 1.0
     for slow, fast in zip(results["1.0"][1], results["1.3"][1]):
+        assert slow["pace"] >= 1.0  # never slower than the narrator's natural reading
         assert fast["pace"] == pytest.approx(min(1.6, slow["pace"] * 1.3), abs=.002)
         assert fast["duration"] < slow["duration"]
     # No paragraph is ever shown over a blank title plate.

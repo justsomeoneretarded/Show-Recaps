@@ -116,20 +116,23 @@ def test_exhausted_source_reuses_real_footage_instead_of_a_blank_plate():
     frame = plan_visuals(section(), "A limited moving frame.", 8, data, usage)
     final = plan_visuals(section(), "No more footage.", 8, data, usage)
     assert not first[0]["still"]
-    assert frame[0]["still"] and not frame[0]["image"]
+    # Moving footage, reused if necessary, always beats a frozen frame.
+    assert all(not shot["still"] for shot in frame + final)
     assert final[0]["source"] == "/clip.mp4"
     assert final[0]["selection"] == "same-season-generic"
     assert any("reused" in message for message in usage.warnings)
 
 
-def test_short_coherent_scene_becomes_smooth_moving_still():
+def test_short_scenes_become_a_quick_moving_cut_not_a_frozen_frame():
     result = plan_visuals(section(), "A full paragraph.", 8, assets(video(start=3, end=5)), tracker())
-    shot = result[0]
-    assert shot["still"] and not shot["image"]
-    assert shot["start"] == 4
-    assert shot["duration"] == 8
-    assert shot["still_motion"] in {"zoom_in", "zoom_out"}
-    assert shot["freeze"] == 0
+    assert all(not shot["still"] for shot in result)
+    assert sum(shot["duration"] for shot in result) == 8
+    assert all(shot["duration"] >= 1.5 for shot in result)
+
+
+def test_only_a_clip_of_stills_falls_back_to_a_moving_still():
+    result = plan_visuals(section(), "A full paragraph.", 8, assets(image("one")), tracker())
+    assert result[0]["still"] and result[0]["image"]
 
 
 def test_available_stills_rotate_across_paragraphs():
