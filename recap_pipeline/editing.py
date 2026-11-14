@@ -193,6 +193,8 @@ RELEASE_DATE = re.compile(
     r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b"
     r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b"
     r"|\b(?:january|february|april|june|july|august|september|october|november|december)\b|\b20\d\d\b", re.I)
+# Network logo cards and credit lines ("prime", "Credit- Prime Video").
+NETWORK_CARD = re.compile(r"\b(?:prime|netflix|hbo|hulu|disney|apple\s*tv|paramount|peacock|amc)\b", re.I)
 SOUND_CAPTION = re.compile(r"\[[a-z ,\-]{3,30}\]|♪", re.I)
 
 
@@ -205,7 +207,18 @@ def _frame_text(path, seconds):
         return ""
 
 
-def _without_text(path, shots, reader):
+def _flat_frame(path, seconds):
+    """True for a mostly empty frame (logo card on black), not a scene with a corner logo."""
+    try:
+        import numpy as np
+        from movie_pipeline.shots import get_frame
+        gray = np.asarray(get_frame(Path(path), seconds).convert("L").resize((160, 90)), dtype=float)
+    except Exception:
+        return False
+    return float(gray.std()) < 28 or float((gray > 40).mean()) < 0.08
+
+
+def _without_text(path, shots, reader, flat=None):
     """Drop scenes showing subscribe screens, captions or title cards.
 
     Gemini flags these when it logs a clip; this covers clips it could not log.
@@ -216,18 +229,23 @@ def _without_text(path, shots, reader):
         return list(shots)
     kept = []
     for shot in shots:
-        if shot.get("source") == "gemini":
-            kept.append(shot)
-            continue
-        text = reader(path, (shot["start"] + shot["end"]) / 2)
+        # Gemini's notes can miss small burned-in captions, so every scene is read.
+        middle = (shot["start"] + shot["end"]) / 2
+        text = reader(path, middle)
+        # A network name alone is usually the official corner logo on good footage; it only
+        # disqualifies a logo card (mostly empty frame) or a "Credit:" overlay.
+        network_card = bool(NETWORK_CARD.search(text)) and (
+            "credit" in text.casefold() or (flat or _flat_frame)(path, middle))
         if (PROMO_TEXT.search(text) or CARD_TEXT.search(text) or RELEASE_DATE.search(text)
-                or SOUND_CAPTION.search(text) or len(re.findall(r"\b[A-Za-z]{3,}\b", text)) >= CAPTION_WORDS):
+                or SOUND_CAPTION.search(text) or network_card
+                or len(re.findall(r"\b[A-Za-z]{3,}\b", text)) >= CAPTION_WORDS):
             continue
         kept.append(shot)
     return kept
 
 
-def analyse_assets(assets: dict, work: Path, usage: UsageTracker, *, analyser=None, text_reader=None) -> dict:
+def analyse_assets(assets: dict, work: Path, usage: UsageTracker, *, analyser=None, text_reader=None,
+                   flat_reader=None) -> dict:
     """Analyse at most six prior-season videos, without downloading matching models.
 
     The local cut/motion analyser is sufficient. Optional matching descriptions in
@@ -257,7 +275,7 @@ def analyse_assets(assets: dict, work: Path, usage: UsageTracker, *, analyser=No
                 raw = analyser(Path(path), work / f"recap-shots-{token}.json")
             usage.shots[path] = _clean_shots(raw, length) if raw else _even_windows(length)
             before = len(usage.shots[path])
-            usage.shots[path] = _without_text(path, usage.shots[path], text_reader or _frame_text)
+            usage.shots[path] = _without_text(path, usage.shots[path], text_reader or _frame_text, flat_reader)
             if len(usage.shots[path]) < before:
                 usage.warn(f"Season {season}: {before - len(usage.shots[path])} scene(s) with on-screen text "
                            f"or subscribe screens were left out of {Path(path).name}.")
@@ -265,7 +283,7 @@ def analyse_assets(assets: dict, work: Path, usage: UsageTracker, *, analyser=No
                 usage.warn(f"Season {season}: no coherent moving shots were found in {Path(path).name}; using evenly spaced windows.")
         except Exception as exc:  # Optional scene analysis must not fail an otherwise valid recap.
             usage.shots[path] = _without_text(path, _even_windows(_number(row.get("duration"))),
-                                              text_reader or _frame_text)
+                                              text_reader or _frame_text, flat_reader)
             usage.warn(f"Season {season}: scene analysis was unavailable for {Path(path).name} "
                        f"({type(exc).__name__}); using evenly spaced windows of its footage.")
     return dict(usage.shots)

@@ -189,6 +189,7 @@ def test_unlogged_scenes_with_captions_or_subscribe_screens_are_dropped(tmp_path
     usage = UsageTracker(3, episode_seasons={})
     shots = analyse_assets({"seasons": {"2": [clip]}}, tmp_path, usage,
                            text_reader=lambda path, second: texts.get(second, ""))["/fan.mp4"]
+    # The Gemini-logged scene at 30 s has no text, so it stays; it is read like the others.
     assert [s["start"] for s in shots] == [20, 30]
     assert any("on-screen text" in w for w in usage.warnings)
 
@@ -201,3 +202,20 @@ def test_release_dates_sound_captions_and_promo_cards_are_dropped(tmp_path, text
     shots = analyse_assets({"seasons": {"2": [clip]}}, tmp_path, UsageTracker(3, episode_seasons={}),
                            text_reader=lambda path, second: text if second == 5.0 else "")["/c.mp4"]
     assert [s["start"] for s in shots] == [10]
+
+
+@pytest.mark.parametrize("text,flat,kept", [
+    ("prime", True, [10]),                  # logo card on black: dropped
+    ("prime video", False, [1, 10]),        # official corner logo on real footage: kept
+    ("Credit- Prime Video", False, [10]),   # credit overlay: dropped
+])
+def test_network_logo_cards_go_but_corner_logos_stay(tmp_path, text, flat, kept):
+    from recap_pipeline.editing import analyse_assets
+    clip = {"kind": "video", "path": "/c.mp4", "season": 2, "episode_ids": [], "scope": "season",
+            "duration": 30.0, "width": 1920, "height": 1080,
+            "shots": [{"start": 1, "end": 9, "source": "gemini", "description": "scene"},
+                      {"start": 10, "end": 18, "source": "gemini", "description": "Reacher"}]}
+    shots = analyse_assets({"seasons": {"2": [clip]}}, tmp_path, UsageTracker(3, episode_seasons={}),
+                           text_reader=lambda path, second: text if second == 5.0 else "",
+                           flat_reader=lambda path, second: flat)["/c.mp4"]
+    assert [s["start"] for s in shots] == kept
