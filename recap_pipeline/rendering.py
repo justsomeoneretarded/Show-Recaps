@@ -325,6 +325,12 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
             usage = UsageTracker(int(_value(spec, "upcoming_season")), allowed_seasons=set(allowed),
                                  episode_seasons=episodes)
             analyses = analyse_assets(scoped_assets, work / "source-analysis", usage)
+            # Picture-level matching and repeat detection across every clip.
+            from .visual_match import VisualIndex
+            usage.visual = VisualIndex.build(usage.shots)
+            report["visual_matching"] = ("off" if usage.visual is None else
+                                         f"{len(usage.visual.vectors)} scenes matched by picture, "
+                                         f"{len(usage.visual.hashes)} fingerprinted")
             gemini = shared_client()
             voice_speed = voice_speed_value(_value(spec, "voice_speed", "1.0"))
             report["voice_speed"] = voice_speed

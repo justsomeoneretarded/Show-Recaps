@@ -221,11 +221,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: work/models
-          key: recap-models-cpu-v1-${{ runner.os }}-${{ env.TTS_MODEL }}
+          key: recap-models-cpu-v2-${{ runner.os }}-${{ env.TTS_MODEL }}
       - name: Install the existing CPU voice package
         run: |
           python -m pip install torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e '.[voice]'
+          # SigLIP 2 picture-to-sentence matching through OpenCLIP (the voice model pins a
+          # transformers version without SigLIP 2); torchvision matches the pinned torch.
+          python -m pip install torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --no-deps open_clip_torch==2.32.0 timm==1.0.15
+          python -m pip install ftfy regex
       - uses: actions/download-artifact@v4
         with:
           name: recap-shared-${{ github.run_id }}

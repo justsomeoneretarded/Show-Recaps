@@ -20,6 +20,7 @@ from movie_pipeline.core import PipelineError
 MAX_ANALYSED_SOURCES = 80
 MAX_NATIVE_SOURCES = 8
 MAX_NATIVE_BEATS = 4
+SEMANTIC_WEIGHT = 14.0  # points per standard deviation of picture-to-sentence match
 DIVERSITY_SECONDS = 12.0  # one point of score lost per 12 s already used from a clip
 SHARP_SHARE = 0.66
 MIN_SHARP_HEIGHT = 700
@@ -76,6 +77,8 @@ class UsageTracker:
     last_source: str | None = None
     beat: int = 0
     source_seconds: dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    visual: object = None   # VisualIndex: picture matching and repeat fingerprints
+    used_hashes: list = field(default_factory=list)
 
     def __post_init__(self):
         incoming = _integer(self.upcoming_season)
@@ -310,6 +313,8 @@ def _visual_options(rows, paragraph, seconds, usage, exact, preferred=None, *, r
     result = []
     text = paragraph.get("text", "") if isinstance(paragraph, dict) else paragraph
     ranks = {key: index for index, key in enumerate(preferred or [])}
+    # How well each scene's picture matches this sentence (local model, Gemini or not).
+    seen = usage.visual.similarity(text) if usage.visual is not None else {}
     for row in rows:
         source = str(row["path"])
         match = _relevance(text, str(row.get("title", "")) + " " + str(row.get("description", "")))
@@ -331,7 +336,11 @@ def _visual_options(rows, paragraph, seconds, usage, exact, preferred=None, *, r
             if _number(shot.get("motion")) > 30:
                 continue  # A fast or unstable source becomes a gentle moving frame instead.
             key = _shot_key(source, shot)
+            repeat = usage.visual is not None and usage.visual.repeats(key, usage.used_hashes)
+            if repeat and not reuse:
+                continue  # the same picture, often from another upload of the same trailer
             bonus = (40 - 4 * ranks[key]) if key in ranks else 0
+            bonus += SEMANTIC_WEIGHT * max(-2.0, min(3.0, seen.get(key, 0.0))) - (40 if repeat else 0)
             # A scene linked to the very story event being narrated is the strongest match.
             if events and shot.get("event_id") in events:
                 bonus += 30
@@ -346,25 +355,28 @@ def _visual_options(rows, paragraph, seconds, usage, exact, preferred=None, *, r
                 score = base - 30 * overlap - (8 if usage.last_source == source else 0)
                 if shot["end"] - shot["start"] + .001 >= seconds:
                     result.append((score, {"row": row, "start": shot["start"], "still": False, "image": False,
-                                           "event_id": shot.get("event_id")}))
+                                           "event_id": shot.get("event_id"), "key": key}))
                 else:
                     # Too short to run for the whole beat: a gently moving frame from its middle.
                     middle = (shot["start"] + shot["end"]) / 2
                     result.append((score - 5 - 3 * usage.image_uses[source + f"@{middle:.3f}"],
                                    {"row": row, "start": middle, "still": True, "image": False,
-                                    "frame_key": source + f"@{middle:.3f}", "event_id": shot.get("event_id")}))
+                                    "frame_key": source + f"@{middle:.3f}", "event_id": shot.get("event_id"),
+                                    "key": key}))
                 continue
             for start, end in _free_windows(source, shot["start"], shot["end"], usage):
                 if end - start + .001 < seconds:
                     continue
                 result.append((base, {"row": row, "start": start, "still": False, "image": False,
-                                      "event_id": shot.get("event_id")}))
+                                      "event_id": shot.get("event_id"), "key": key}))
         # A short coherent shot can provide one gently moving frame. Never freeze
         # an arbitrary trailer end or loop its last shot to fill narration.
         if not reuse and not any(value[1]["row"] is row for value in result):
             for shot in raw:
                 middle = (shot["start"] + shot["end"]) / 2
                 marker = source + f"@{middle:.3f}"
+                if usage.visual is not None and usage.visual.repeats(_shot_key(source, shot), usage.used_hashes):
+                    continue
                 if usage.image_uses[marker] == 0:
                     result.append((100 * exact + 5 + match + _quality(shot),
                                    {"row": row, "start": middle, "still": True,
@@ -449,6 +461,8 @@ def plan_visuals(section: dict, paragraph, seconds: float, assets: dict, usage: 
                              "other-season-fallback" if borrowed else
                              "orientation-footage" if season is None else "same-season-generic"}
         plan.append(shot)
+        if usage.visual is not None and chosen.get("key") in usage.visual.hashes:
+            usage.used_hashes.append(usage.visual.hashes[chosen["key"]])
         usage.beat += 1
         usage.last_source = source
         if shot["still"]:
