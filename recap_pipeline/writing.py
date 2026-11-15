@@ -14,7 +14,7 @@ from movie_pipeline.core import PipelineError, key, save_json
 from recap_pipeline.gemini import GeminiClient, GeminiUnavailable, configured_key
 from recap_pipeline.models import MAX_VIDEO_MINUTES, narration_within_scope, voice_speed_value
 
-POLICY_VERSION = 10
+POLICY_VERSION = 11
 WORDS_PER_SECOND = 2.7  # measured 2.9 in production; lower keeps the estimate long
 FIXED_SECONDS = 20.0  # end screen, holds and title beats
 MAX_EPISODES_PER_BATCH = 6
@@ -279,15 +279,19 @@ def build_ledger(bundle, cache_dir, writer=None):
     for batch in _batch(material, max_items=MAX_EPISODES_PER_BATCH):
         def extract(batch=batch):
             raw = _ask(writer,
-                "TASK: EXTRACT_LEDGER. Extract the consequential plot events in chronological order. "
-                "Use only these episodes. For every event name episode_id, a concise factual summary, "
+                "TASK: EXTRACT_LEDGER. Extract EVERY distinct plot beat in chronological order: each "
+                "discovery, decision, confrontation, fight, death, reveal, betrayal and turn that moves "
+                "the story, as its own event (usually one event per one or two sentences of summary, "
+                "several per episode). Never compress an episode into one event; merge sentences only "
+                "when they describe the same moment. Use only these episodes. For every event name episode_id, a concise factual summary, "
                 "cause and consequence (empty unless explicit), and evidence with a source_id from "
                 "that episode and an EXACT verbatim quote from its summary. Do not turn unanswered "
                 "questions into resolutions. Do not infer motives or use outside memory. There is no "
                 "event quota; omit unsupported details. Set ending_state true ONLY for an explicit "
                 "character or conflict state at the END of a marked final episode, including supported "
                 "unresolved conflicts. A teaser question or an earlier temporary situation is not an "
-                "ending state. Otherwise set false.", {"episodes": batch}, _LEDGER_SCHEMA)
+                "ending state. Otherwise set false.", {"episodes": batch}, _LEDGER_SCHEMA,
+                num_predict=9000)
             candidates = []
             local = {e["id"]: episode_map[e["id"]] for e in batch}
             raw_events = raw.get("events", []) if isinstance(raw.get("events"), list) else []
