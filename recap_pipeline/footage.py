@@ -142,11 +142,21 @@ def junk_text(words, *, flat: bool = False) -> bool:
                 or (flat and any(len(word) >= 2 for word in letters)))
 
 
-def _check(frame_paths, reader):
-    """(clean, reason, middle image path, motion) for one shot from its kept frames."""
+TEXT_STEP = 3   # text is read on every third frame (0.75 s at 4 fps), so a card dissolved into a shot is seen
+
+
+def _check(frame_paths, reader, junk=None):
+    """(clean, reason, middle image path, motion) for one shot from its kept frames.
+
+    When ``junk`` is a list, the indices of frames carrying on-screen text are added to it
+    (every sampled frame is read), so the caller can cut a title card out of a shot whose
+    edges no cut detector found (a dissolve into and out of the card).
+    """
     from PIL import Image
     import numpy as np
     grays, means = [], []
+    found_text = False
+    last = len(frame_paths) - 1
     for index, frame in enumerate(frame_paths):
         with Image.open(frame) as image:
             image.load()
@@ -155,13 +165,16 @@ def _check(frame_paths, reader):
             means.append(mean)
             # Night scenes stay; a frame with almost nothing lit is a fade or a black card.
             flat = std < FLAT_STD or float((gray > 40).mean()) < 0.08
-            # Text is read on the middle frame, and on the first and last of longer shots.
-            ends = {0, len(frame_paths) - 1} if len(frame_paths) >= 10 else set()
-            if index in ends | {len(frame_paths) // 2}:
+            if index % TEXT_STEP == 0 or index in (last, len(frame_paths) // 2):
                 if junk_text(reader(image), flat=flat):
-                    return False, "text", None, 0.0
-            if flat and mean >= DARK_MEAN:
+                    found_text = True
+                    if junk is None:
+                        return False, "text", None, 0.0
+                    junk.append(index)
+            if flat and mean >= DARK_MEAN and not found_text:
                 return False, "flat", None, 0.0
+    if found_text:
+        return False, "text", None, 0.0
     if max(means) < DARK_MEAN or sorted(means)[len(means) // 2] < DARK_MEAN * 0.7:
         return False, "dark", None, 0.0
     if sorted(means)[len(means) // 2] > BRIGHT_MEAN:
@@ -204,15 +217,44 @@ def analyse(path: Path, length: float, work: Path, *, reader=None, scanner=None,
         raw = _intervals(length, cuts, blacks, start, end)
         times = sorted(frames)
 
-        def inspect(shot):
+        def frames_of(shot):
             inside = [t for t in times if shot["start"] + EDGE <= t <= shot["end"] - EDGE]
             if not inside:
                 middle = (shot["start"] + shot["end"]) / 2
                 inside = [min(times, key=lambda t: abs(t - middle))]
-            return _check([frames[t] for t in inside], reader)
+            return inside
+
+        def inspect(shot):
+            inside = frames_of(shot)
+            junk = []
+            result = _check([frames[t] for t in inside], reader, junk)
+            if result[0] or result[1] != "text" or not junk:
+                return [(shot, result)]
+            # Text on some frames only: a card dissolved into the shot. Cut it out with a
+            # margin of one sampling step and keep what is left, as new (uncut) shots.
+            margin = TEXT_STEP / FRAME_RATE
+            spans = [(inside[i] - margin, inside[i] + margin) for i in junk]
+            pieces, cursor = [], shot["start"]
+            for low, high in sorted(spans):
+                if low > cursor:
+                    pieces.append((cursor, low))
+                cursor = max(cursor, high)
+            pieces.append((cursor, shot["end"]))
+            kept = []
+            for low, high in pieces:
+                low, high = max(low, shot["start"]), min(high, shot["end"])
+                if high - low < MIN_SHOT * 2:
+                    continue
+                part = {**shot, "start": round(low, 3), "end": round(high, 3),
+                        "cut_in": shot["cut_in"] and low == shot["start"]}
+                checked = _check([frames[t] for t in frames_of(part)], reader)
+                kept.append((part, checked))
+            return kept or [(shot, result)]
 
         with ThreadPoolExecutor(max_workers=4) as pool:
-            checks = list(pool.map(inspect, raw))
+            inspected = [item for items in pool.map(inspect, raw) for item in items]
+        raw = [shot for shot, _ in inspected]
+        checks = [check for _, check in inspected]
         keep.mkdir(parents=True, exist_ok=True)
         shots, run, previous_end, dropped = [], 0, None, {}
         for shot, (clean, reason, frame, motion) in zip(raw, checks):

@@ -86,3 +86,25 @@ def test_reused_footage_is_reframed_and_overlay_clips_cropped():
     assert not any(shot["reframe"] for shot in first)
     again = plan_visuals(section, "Reacher arrives again.", 4.0, assets, usage)
     assert again[0]["reframe"] and not again[0]["still"]
+
+
+def test_title_card_dissolved_into_a_shot_is_cut_out(tmp_path):
+    rng = np.random.default_rng(5)
+    frames = {}
+    for index in range(4 * 8):   # 8 seconds at 4 frames per second, no cut detected anywhere
+        t = round(index / footage.FRAME_RATE, 2)
+        coarse = (rng.random((9, 16)) * 160 + 40).astype(np.uint8)   # broad shapes, like real footage
+        path = tmp_path / f"{index:03}.jpg"
+        Image.fromarray(coarse).resize((480, 270)).convert("RGB").save(path)
+        frames[t] = path
+    card = {path for t, path in frames.items() if 3.0 <= t <= 4.25}
+
+    def reader(image):
+        return ["NEW", "SEASON", "FEBRUARY"] if image.filename and __import__("pathlib").Path(image.filename) in card else []
+
+    shots, dropped = footage.analyse(tmp_path / "clip.mp4", 9.0, tmp_path, reader=reader,
+                                     scanner=lambda path, folder: ([], [], frames), promo_cutoff=9.0)
+    assert shots, dropped
+    assert all(s["end"] <= 3.0 or s["start"] >= 4.25 for s in shots)
+    assert any(s["start"] < 3.0 for s in shots) and any(s["start"] >= 4.25 for s in shots)
+    assert len({s["run"] for s in shots}) == 2  # the card splits the source's continuous run
