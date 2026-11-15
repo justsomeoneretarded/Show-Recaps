@@ -544,7 +544,7 @@ def plan_visuals(section: dict, paragraph, seconds: float, assets: dict, usage: 
     """Fill all narration with real footage, normally coherent 6–10 second cuts.
 
     Order of preference: this paragraph's episode, fresh same-season footage,
-    fresh footage from another covered season, then the least-used footage again.
+    the season's least-used footage again (reframed), then another covered season's footage.
     ``preferred`` is Gemini's ranking of scene keys for this paragraph.
     """
     seconds = _number(seconds)
@@ -552,8 +552,10 @@ def plan_visuals(section: dict, paragraph, seconds: float, assets: dict, usage: 
         raise PipelineError("A recap paragraph must have a positive measured duration.")
     season, ids, exact, generic, others = _pool(section, paragraph, assets, usage, episode_ids)
     # (rows, exact episode, reuse used footage, borrowed from another season), best first.
-    tiers = [(exact, True, False, False), (generic, False, False, False), (others, False, False, True),
-             (exact + generic, False, True, False), (others, False, True, True)]
+    # The narrated season's own footage, reused and reframed, tells the story better than another
+    # season's pictures (other characters, other villains): borrowing is the last resort.
+    tiers = [(exact, True, False, False), (generic, False, False, False),
+             (exact + generic, False, True, False), (others, False, False, True), (others, False, True, True)]
     plan = []
     remaining = seconds
     while remaining > 0.05:
