@@ -74,6 +74,16 @@ def _read_image(path: Path) -> Image.Image:
     return image
 
 
+def _sharpness(image) -> float:
+    """Edge contrast of a downscaled frame; higher is crisper (and properly lit)."""
+    from PIL import ImageFilter, ImageStat
+    try:
+        gray = image.convert("L").resize((480, 270))
+        return float(ImageStat.Stat(gray.filter(ImageFilter.FIND_EDGES)).stddev[0])
+    except (OSError, ValueError):
+        return 0.0
+
+
 def _source_images(script: dict, bundle: dict, assets: dict, work: Path) -> tuple[list[tuple], list[str]]:
     seasons, _incoming, _title = _scope(script, bundle)
     episode_seasons = {
@@ -136,7 +146,8 @@ def _source_images(script: dict, bundle: dict, assets: dict, work: Path) -> tupl
                 warnings.append(f"Could not read a verified thumbnail source for season {season}.")
     # A true episode image/frame takes priority over an illustrative show poster,
     # and Gemini-picked moments over fixed positions in a clip.
-    result.sort(key=lambda row: (row[1]["illustrative"], not row[1].get("gemini_pick")))
+    # Among those, the sharpest frames first: a motion-blurred frame makes a weak thumbnail.
+    result.sort(key=lambda row: (row[1]["illustrative"], not row[1].get("gemini_pick"), -_sharpness(row[0])))
     if any(not row[1]["illustrative"] for row in result):
         result = [row for row in result if not row[1]["illustrative"]]
     return result, warnings

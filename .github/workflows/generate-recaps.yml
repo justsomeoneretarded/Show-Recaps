@@ -109,7 +109,9 @@ env:
   VOICE_SPEED: ${{ inputs.voice_speed }}
   # auto (Gemini when the key is set), gemini or local; set as a repository variable.
   RECAP_WRITER: ${{ vars.RECAP_WRITER || 'auto' }}
-  RECAP_MAX_CLIPS_PER_SEASON: ${{ vars.RECAP_MAX_CLIPS_PER_SEASON || '14' }}
+  RECAP_MAX_CLIPS_PER_SEASON: ${{ vars.RECAP_MAX_CLIPS_PER_SEASON || '16' }}
+  # Web-researched detailed episode plots (Gemini with Google Search); set to off to skip.
+  RECAP_DEEP_RESEARCH: ${{ vars.RECAP_DEEP_RESEARCH || 'on' }}
   # Seconds between Gemini requests; spacing keeps the free tier under its per-minute limit.
   GEMINI_MIN_INTERVAL: ${{ vars.GEMINI_MIN_INTERVAL || '6' }}
   HF_HOME: ${{ github.workspace }}/work/models/huggingface

@@ -232,6 +232,12 @@ def speech_video(source: Path, audio: Path, chosen: list[dict], output: Path, la
             continue
         out = work / f"shot-{index:03}.mp4"
         filters = f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,crop={width}:{height},setsar=1,fps={FPS}"
+        reframe, anchor = shot.get("reframe"), shot.get("crop_anchor")
+        if (reframe or anchor) and not shot.get("image") and not shot.get("animation"):
+            # A burned-in overlay band is cropped away; footage shown a second time is
+            # reframed (a tighter, offset crop) so it reads as a new shot.
+            fx, fy = anchor or ((0.0, 0.0), (1.0, 0.0), (0.5, 0.5), (0.0, 1.0), (1.0, 1.0))[int(reframe) % 5]
+            filters = f"crop=iw*0.84:ih*0.84:(iw-ow)*{float(fx)}:(ih-oh)*{float(fy)}," + filters
         if not shot.get("image") and not shot.get("animation"):
             filters += ","+footage_grade()
         hold_frames = min(max(0, round(shot.get("freeze", 0)*FPS)), max(0, frames-1))

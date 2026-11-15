@@ -32,6 +32,10 @@ class GeminiUnavailable(PipelineError):
     """Quota, outage or unusable output: a local model may take over."""
 
 
+class NotGrounded(PipelineError):
+    """A search-grounded answer cited no web source; the caller discards it (no retry)."""
+
+
 KEY_NAMES = ("GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GOOGLE_API_KEY")
 
 
@@ -125,6 +129,36 @@ class GeminiClient:
         body = {"systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [*(media or []), {"text": prompt}]}],
                 "generationConfig": config, "safetySettings": SAFETY}
+        return self._request(body, lambda payload: json.loads(_text(payload)))
+
+    def generate_grounded(self, system, prompt, *, max_tokens=32768):
+        """Answer researched with Google Search: (text, [{"uri", "title"}] of the web sources used).
+
+        Raises NotGrounded when the answer cited no web source.
+        """
+        if not self.key:
+            raise PipelineError("GEMINI_API_KEY is not configured.")
+        if self.unavailable:
+            raise GeminiUnavailable("Gemini was unavailable earlier in this run.")
+        body = {"systemInstruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "tools": [{"google_search": {}}],
+                "generationConfig": {"maxOutputTokens": max_tokens}, "safetySettings": SAFETY}
+
+        def parse(payload):
+            text = _text(payload)
+            metadata = (payload.get("candidates") or [{}])[0].get("groundingMetadata") or {}
+            sources = []
+            for chunk in metadata.get("groundingChunks") or []:
+                web = chunk.get("web") if isinstance(chunk, dict) else None
+                if isinstance(web, dict) and web.get("uri"):
+                    sources.append({"uri": str(web["uri"]), "title": str(web.get("title") or "")})
+            if not sources:
+                raise NotGrounded("Gemini's answer was not grounded in any web source.")
+            return text, sources
+        return self._request(body, parse)
+
+    def _request(self, body, parse):
         url = f"{API_ROOT}/{self.model}:generateContent"
         last_problem = "no attempt was made"
         tried = {self.index}
@@ -158,7 +192,7 @@ class GeminiClient:
                 if response.status_code not in RETRY_STATUSES:
                     try:
                         response.raise_for_status()
-                        return json.loads(_text(response.json()))
+                        return parse(response.json())
                     except GeminiUnavailable as exc:
                         last_problem = str(exc)
                     except (ValueError, requests.HTTPError) as exc:

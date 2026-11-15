@@ -19,7 +19,7 @@ from movie_pipeline.core import PipelineError, ffmpeg, normalized
 
 from .gemini import GeminiUnavailable
 
-ANALYSIS_VERSION = 1
+ANALYSIS_VERSION = 2
 MAX_QUERY_SUGGESTIONS = 10
 MAX_SCENE_SECONDS = 20.0
 MIN_SCENE_SECONDS = 1.0
@@ -48,7 +48,8 @@ SCENE_SCHEMA = _object({
     "scenes": {"type": "array", "items": _object({
         "start": _NUMBER, "end": _NUMBER, "description": _TEXT, "characters": _STRINGS,
         "quality": {"type": "integer"}, "usable": _BOOL, "watermark": _BOOL,
-        "letterbox": _BOOL, "on_screen_text": _BOOL, "interview": _BOOL, "dark": _BOOL})},
+        "letterbox": _BOOL, "on_screen_text": _BOOL, "interview": _BOOL, "dark": _BOOL,
+        "event_id": _TEXT, "event_confidence": _NUMBER})},
     "thumbnail_times": {"type": "array", "items": _NUMBER},
 })
 RANK_SCHEMA = _object({"ranked": _STRINGS})
@@ -105,8 +106,13 @@ def _proxy(path: Path, work: Path) -> Path:
     return target
 
 
-def clean_scenes(raw: dict, length: float) -> tuple[list[dict], list[float]]:
-    """Keep usable, clean scenes inside the clip; split long ones into editable windows."""
+def clean_scenes(raw: dict, length: float, events: dict | None = None) -> tuple[list[dict], list[float]]:
+    """Keep usable, clean scenes inside the clip; split long ones into editable windows.
+
+    ``events`` maps the season's sourced event ids to events; a scene keeps an
+    event link only for a listed id given with confidence.
+    """
+    events = events or {}
     scenes = []
     for row in raw.get("scenes", []) if isinstance(raw.get("scenes"), list) else []:
         if not isinstance(row, dict):
@@ -123,6 +129,10 @@ def clean_scenes(raw: dict, length: float) -> tuple[list[dict], list[float]]:
                 "quality": quality, "watermark": bool(row.get("watermark")),
                 "letterbox": bool(row.get("letterbox")), "dark": bool(row.get("dark")),
                 "motion": 0.0, "source": "gemini"}
+        event = events.get(str(row.get("event_id") or ""))
+        if event is not None and _number(row.get("event_confidence"), 0) >= MIN_LINK_CONFIDENCE:
+            base.update(event_id=str(event["id"]), episode_id=str(event.get("episode_id") or ""),
+                        event_summary=str(event.get("summary", ""))[:300])
         point = start
         while end - point >= MIN_SCENE_SECONDS:
             stop = min(end, point + MAX_SCENE_SECONDS)
@@ -135,10 +145,17 @@ def clean_scenes(raw: dict, length: float) -> tuple[list[dict], list[float]]:
 
 
 def analyse_clip(client, path: Path, length: float, show: dict, season: int,
-                 episode_titles: list[str], work: Path) -> dict | None:
-    """Watch one downloaded clip and return clean scenes; cached beside the clip."""
+                 episode_titles: list[str], work: Path, events: list[dict] | None = None) -> dict | None:
+    """Watch one downloaded clip and return clean scenes; cached beside the clip.
+
+    With ``events`` (this season's sourced story events) the same request also
+    links each scene to the event it shows, so no separate linking call is made.
+    """
     path = Path(path)
-    digest = hashlib.sha256(f"{path.name}:{path.stat().st_size}:{length:.2f}:{ANALYSIS_VERSION}".encode()).hexdigest()[:16]
+    events = [e for e in events or [] if isinstance(e, dict) and e.get("id")][:60]
+    event_map = {str(e["id"]): e for e in events}
+    digest = hashlib.sha256(f"{path.name}:{path.stat().st_size}:{length:.2f}:{ANALYSIS_VERSION}:"
+                            f"{sorted(event_map)}".encode()).hexdigest()[:16]
     cache = path.with_name(path.stem + f".gemini-{digest}.json")
     if cache.is_file():
         try:
@@ -168,8 +185,13 @@ def analyse_clip(client, path: Path, length: float, show: dict, season: int,
             "(cast or crew talking to camera, behind the scenes), dark (too dark to read). Set usable false "
             "for logos, black frames, title cards and anything that is not footage from the show itself. "
             "Also give up to four thumbnail_times: moments with a sharp, well-lit, expressive close-up "
-            "or striking action, without text or watermark.\nDATA: " + json.dumps(
-                {"show": show.get("title"), "season": season, "episode_titles": episode_titles[:30]},
+            "or striking action, without text or watermark. "
+            "events lists this season's sourced story events: when a scene clearly shows one (the same "
+            "characters doing the described action in the described place) give its event_id and your "
+            "confidence 0-1; otherwise an empty event_id. Never guess.\nDATA: " + json.dumps(
+                {"show": show.get("title"), "season": season, "episode_titles": episode_titles[:30],
+                 "events": [{"event_id": str(e["id"]), "episode": e.get("episode"),
+                             "summary": str(e.get("summary", ""))[:200]} for e in events]},
                 ensure_ascii=False)),
             SCENE_SCHEMA, media=media, media_resolution="MEDIA_RESOLUTION_LOW")
     except (GeminiUnavailable, PipelineError, OSError, KeyError) as exc:
@@ -179,8 +201,9 @@ def analyse_clip(client, path: Path, length: float, show: dict, season: int,
     finally:
         if resource is not None:
             client.delete_file(resource)
-    scenes, times = clean_scenes(raw, length)
-    result = {"version": ANALYSIS_VERSION, "scenes": scenes, "thumbnail_times": times}
+    scenes, times = clean_scenes(raw, length, event_map)
+    result = {"version": ANALYSIS_VERSION, "scenes": scenes, "thumbnail_times": times,
+              "events_checked": bool(event_map)}
     try:
         cache.write_text(json.dumps(result), encoding="utf-8")
     except OSError:

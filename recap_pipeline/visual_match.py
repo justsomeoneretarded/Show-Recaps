@@ -63,7 +63,12 @@ class VisualIndex:
         for source, shots in shots_by_source.items():
             for shot in shots:
                 try:
-                    image = frame_reader(source, (float(shot["start"]) + float(shot["end"])) / 2)
+                    if shot.get("frame") and Path(shot["frame"]).is_file():
+                        from PIL import Image
+                        with Image.open(shot["frame"]) as kept:
+                            image = kept.convert("RGB")  # already read during shot analysis
+                    else:
+                        image = frame_reader(source, (float(shot["start"]) + float(shot["end"])) / 2)
                 except Exception:
                     continue
                 key = _key(source, shot["start"])

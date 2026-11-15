@@ -229,7 +229,7 @@ def test_collecting_with_no_reachable_footage_fails_instead_of_a_blank_plate(mon
 def test_logging_attaches_gemini_scenes_to_each_clip(monkeypatch, tmp_path):
     seen = []
 
-    def analyse(client, path, length, show, season, titles, work):
+    def analyse(client, path, length, show, season, titles, work, events=None):
         seen.append(path.name)
         return {"scenes": [{"start": 1, "end": 9, "description": "Dock", "motion": 0.0}], "thumbnail_times": [4]}
     monkeypatch.setattr(gemini_media, "analyse_clip", analyse)

@@ -27,9 +27,9 @@ from movie_pipeline.core import PipelineError, normalized, probe
 from movie_pipeline.video_settings import require_disk
 
 CACHE_VERSION = 3
-MAX_VIDEOS = 14
-MAX_CANDIDATES = 60
-MAX_DOWNLOAD_ATTEMPTS = 30
+MAX_VIDEOS = 16
+MAX_CANDIDATES = 90
+MAX_DOWNLOAD_ATTEMPTS = 40
 SEARCH_RESULTS = 8
 MAX_VIDEO_BYTES = 400_000_000
 MAX_RUN_BYTES = 9_000_000_000
@@ -261,6 +261,41 @@ def season_windows(seasons: list[dict]) -> dict[int, tuple]:
     return result
 
 
+MAX_TRAILERS = 4          # official trailers share most shots; scenes and clips add new footage
+DUPLICATE_SHARE = 0.4     # a clip whose pictures mostly appear in an earlier clip is a re-upload
+TRAILER = re.compile(r"\b(trailer|teaser)\b", re.I)
+
+
+def _signature(path: Path) -> list[int]:
+    """One 64-bit picture fingerprint per second, for spotting re-uploads of the same footage."""
+    import subprocess
+    try:
+        result = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-an", "-vf",
+                                 "fps=1,scale=9:8,format=gray", "-f", "rawvideo", "-"],
+                                capture_output=True, timeout=600, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    data, hashes = result.stdout, []
+    for offset in range(0, len(data) - 71, 72):
+        rows = data[offset:offset + 72]
+        bits = 0
+        for row in range(8):
+            line = rows[row * 9:(row + 1) * 9]
+            for column in range(8):
+                bits = (bits << 1) | (line[column + 1] > line[column])
+        # Fades and black frames match everything; they are not evidence.
+        if 4 < bin(bits).count("1") < 60:
+            hashes.append(bits)
+    return hashes
+
+
+def duplicate_share(candidate: list[int], earlier: list[int]) -> float:
+    if not candidate or not earlier:
+        return 0.0
+    hits = sum(1 for value in candidate if any(bin(value ^ other).count("1") <= 8 for other in earlier))
+    return hits / len(candidate)
+
+
 def _clip_limit() -> int:
     try:
         limit = int(os.environ.get("RECAP_MAX_CLIPS_PER_SEASON", str(MAX_VIDEOS)))
@@ -319,10 +354,13 @@ def _discover_videos(show: dict, season: dict, incoming: int, root: Path,
                 seen.add(url)
                 if not candidate_ok(info, show, number, incoming, season.get("year"), window):
                     continue
+                if TRAILER.search(str(info.get("title") or "")) and sum(
+                        1 for item in accepted if TRAILER.search(item["title"])) >= MAX_TRAILERS:
+                    continue  # enough trailers: look for scenes and clips with new footage
                 attempts += 1
                 if budget.used + MAX_VIDEO_BYTES > MAX_RUN_BYTES:
                     warnings.append(f"Season {number}: footage search stopped at the shared source byte budget.")
-                    return accepted
+                    return [{k: v for k, v in item.items() if k != "_signature"} for item in accepted]
                 require_disk(root)
                 progress: dict[str, int] = {}
                 source_bytes = 0
@@ -353,6 +391,12 @@ def _discover_videos(show: dict, season: dict, incoming: int, root: Path,
                         metadata = _video_info(attempt)
                         # Include bytes even when a mocked/extractor path omits progress hooks.
                         budget.add(max(0, attempt.stat().st_size - source_bytes))
+                        signature = _signature(attempt)
+                        if any(duplicate_share(signature, item.get("_signature") or []) >= DUPLICATE_SHARE
+                               for item in accepted):
+                            warnings.append(f"Season {number}: skipped a re-upload of footage already "
+                                            f"downloaded ({str(info.get('title') or '')[:60]}).")
+                            continue
                         destination = root / f"video-{_hash(url)}.mp4"
                         attempt.replace(destination)
                         evidence = {key: info.get(key) for key in
@@ -362,7 +406,8 @@ def _discover_videos(show: dict, season: dict, incoming: int, root: Path,
                                          "title": str(info.get("title") or ""), "season": number,
                                          "kind": "video", **metadata, "episode_ids": [],
                                          "scope": "season", "illustrative": False, "metadata": evidence,
-                                         "identity_evidence": _identity_evidence(info, show)})
+                                         "identity_evidence": _identity_evidence(info, show),
+                                         "_signature": signature})
                         download_access.record_route_success(route)
                     except (yt_dlp.utils.DownloadError, OSError, ValueError, PipelineError) as exc:
                         blocked = _blocked(exc)
@@ -372,7 +417,7 @@ def _discover_videos(show: dict, season: dict, incoming: int, root: Path,
         if len(accepted) >= max_videos or not blocked:
             break
         warnings.append(f"Season {number}: optional video provider blocked the {route} route; trying available fallback sources.")
-    return accepted
+    return [{k: v for k, v in item.items() if k != "_signature"} for item in accepted]
 
 
 def _image_url(value) -> str | None:
@@ -670,7 +715,8 @@ def _remove_letterbox(asset: dict, warnings: list[str]) -> None:
         warnings.append(f"Letterbox removal was skipped for {path.name}.")
 
 
-def _log_clips(assets: list[dict], show: dict, season: dict, root: Path, client, warnings: list[str]) -> None:
+def _log_clips(assets: list[dict], show: dict, season: dict, root: Path, client, warnings: list[str],
+               events: list[dict] | None = None) -> None:
     """Gemini watches each clip and logs clean scenes; skipped silently without a key."""
     from .gemini_media import analyse_clip
     titles = [str(e.get("title") or "") for e in season.get("episodes") or []]
@@ -680,9 +726,10 @@ def _log_clips(assets: list[dict], show: dict, season: dict, root: Path, client,
             continue
         _remove_letterbox(asset, warnings)
         result = analyse_clip(client, Path(asset["path"]), float(asset.get("duration") or 0), show,
-                              int(season["number"]), titles, root / "gemini")
+                              int(season["number"]), titles, root / "gemini", events=events)
         if result and result.get("scenes"):
             asset["shots"] = result["scenes"]
+            asset["events_checked"] = bool(result.get("events_checked"))
             asset["thumbnail_times"] = result.get("thumbnail_times", [])
             logged += 1
     if client is not None and assets:
@@ -690,7 +737,7 @@ def _log_clips(assets: list[dict], show: dict, season: dict, root: Path, client,
                         f"{sum(a.get('kind') == 'video' for a in assets)} clips.")
 
 
-def collect_assets(bundle: dict, spec, cache_dir: Path) -> dict:
+def collect_assets(bundle: dict, spec, cache_dir: Path, ledger: dict | None = None) -> dict:
     """Return local video/image paths shared by season and series recaps.
 
     Every returned season precedes spec.upcoming_season. Generic show posters
@@ -742,7 +789,9 @@ def collect_assets(bundle: dict, spec, cache_dir: Path) -> dict:
         else:
             assets = _fallback_images(show, season, season_root, budget, result["warnings"],
                                       cached=cached, limit=image_limit)
-        _log_clips(assets, show, season, season_root, client, result["warnings"])
+        season_events = [event for event in (ledger or {}).get("events", [])
+                         if isinstance(event, dict) and str(event.get("season")) == str(number)]
+        _log_clips(assets, show, season, season_root, client, result["warnings"], season_events)
         payload = {"version": CACHE_VERSION, "image_limit": image_limit,
                    "fingerprint": _fingerprint(show, season), "assets": assets}
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", dir=season_root, delete=False) as temporary:
@@ -782,7 +831,7 @@ def link_footage(collected: dict, ledger: dict, client=None) -> dict[str, float]
             already = {i: s for i, s in enumerate(shots) if s.get("event_id")}
             links = already and {i: {"id": s["event_id"], "episode_id": s.get("episode_id"),
                                      "summary": s.get("event_summary", "")} for i, s in already.items()}
-            if not links:
+            if not links and not row.get("events_checked"):  # logging already linked this clip
                 links = link_scenes(client, shots, events)
             scenes += len(shots)
             for index, event in links.items():

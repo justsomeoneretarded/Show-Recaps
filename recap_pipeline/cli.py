@@ -77,6 +77,10 @@ def research_stage(shared):
     shared = Path(shared)
     spec = load_spec(shared, create=True)
     bundle = research_show(spec, shared / "research-cache")
+    if os.getenv("RECAP_DEEP_RESEARCH", "on").strip().lower() != "off" \
+            and os.getenv("RECAP_WRITER", "auto").strip().lower() != "local":
+        from .deep_research import deepen
+        bundle = deepen(bundle, shared / "research-cache")
     save_json(shared / "research.json", bundle)
     return bundle
 
@@ -149,8 +153,9 @@ def assets_stage(shared):
         script = shared / f"{kind}-script.json"
         if script.exists():
             validate_script_scope(_read(script), spec, bundle)
-    assets = collect_assets(bundle, spec, (shared / "asset-cache").resolve())
     ledger_path = shared / "story-ledger.json"
+    assets = collect_assets(bundle, spec, (shared / "asset-cache").resolve(),
+                            _read(ledger_path) if ledger_path.exists() else None)
     if ledger_path.exists():
         footage = link_footage(assets, _read(ledger_path), shared_client())
         save_json(shared / "footage.json", footage)

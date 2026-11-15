@@ -245,8 +245,27 @@ def _without_text(path, shots, reader, flat=None):
     return kept
 
 
+def _precise_shots(row, path, length, work, usage, season, analyser):
+    """Frame-accurate, individually checked shots with Gemini's notes attached; False when unavailable."""
+    from .footage import analyse as precise_analyse, merge_notes
+    notes = row.get("shots") if isinstance(row.get("shots"), list) else []
+    logged = any(isinstance(shot, dict) and shot.get("source") == "gemini" for shot in notes)
+    try:
+        shots, dropped = (analyser if callable(analyser) else precise_analyse)(Path(path), length, work)
+    except Exception as exc:  # optional: the older analysis takes over
+        print(f"Precise shot analysis unavailable for {Path(path).name} ({type(exc).__name__}).", flush=True)
+        return False
+    kept = merge_notes(shots, _clean_shots(notes, length), path, logged=logged) if logged else shots
+    removed = sum(dropped.values()) + len(shots) - len(kept)
+    if removed:
+        usage.warn(f"Season {season}: {removed} source shot(s) with on-screen text, logos, fades or "
+                   f"unusable picture were left out of {Path(path).name}.")
+    usage.shots[path] = kept
+    return True
+
+
 def analyse_assets(assets: dict, work: Path, usage: UsageTracker, *, analyser=None, text_reader=None,
-                   flat_reader=None) -> dict:
+                   flat_reader=None, precise=None) -> dict:
     """Analyse at most six prior-season videos, without downloading matching models.
 
     The local cut/motion analyser is sufficient. Optional matching descriptions in
@@ -265,8 +284,10 @@ def analyse_assets(assets: dict, work: Path, usage: UsageTracker, *, analyser=No
             usage.warn(f"Visual analysis stopped at {MAX_ANALYSED_SOURCES} sources; remaining footage uses evenly spaced windows.")
             break
         usage.analysed_sources.add(path)
+        length = _number(row.get("duration"))
+        if precise is not False and _precise_shots(row, path, length, work, usage, season, precise):
+            continue
         try:
-            length = _number(row.get("duration"))
             raw = row.get("shots")
             if not isinstance(raw, list):
                 if analyser is None:
@@ -351,6 +372,10 @@ def _visual_options(rows, paragraph, seconds, usage, exact, preferred=None, *, r
             raw = _clean_shots(row["shots"], length)  # a clip of only title cards stays unused
         else:
             raw = _even_windows(length)
+        if raw and raw[0].get("precise"):
+            result.extend(_sequence_options(row, raw, text, seconds, usage, exact, match, ranks, seen,
+                                            reuse=reuse, events=events))
+            continue
         for shot in raw:
             if _number(shot.get("motion")) > 30:
                 continue  # A fast or unstable source becomes a gentle moving frame instead.
@@ -403,6 +428,89 @@ def _visual_options(rows, paragraph, seconds, usage, exact, preferred=None, *, r
     return result
 
 
+FLASH = 0.4        # never end a shot this soon after a source cut (a flash frame)
+EDGE = 0.05        # start just inside a source cut
+MAX_MOTION = 45.0  # frame-to-frame change (0-255) beyond which footage is too shaky to narrate over
+
+
+def _window(raw, index, seconds):
+    """(start, covered shots) for ``seconds`` of footage that starts on shot ``index``'s cut.
+
+    The window may continue through the following shots of the same run (the
+    source's own edit) but never past a removed shot or a fade, and never ends
+    just after a cut.
+    """
+    first = raw[index]
+    chain, k = [first], index
+    while chain[-1]["end"] - first["start"] < seconds + EDGE and k + 1 < len(raw) \
+            and raw[k + 1].get("run") == first.get("run") and raw[k + 1]["start"] - chain[-1]["end"] < 0.15:
+        k += 1
+        chain.append(raw[k])
+    limit = chain[-1]["end"] - EDGE
+    offset = 0.0
+    while first["start"] + offset < first["end"] - FLASH:
+        start = first["start"] + EDGE + offset
+        end = start + seconds
+        if end > limit + 1e-6:
+            return None
+        cuts = [shot["start"] for shot in chain[1:] if shot["start"] < end]
+        if not cuts or end - cuts[-1] >= FLASH:
+            return start, [shot for shot in chain if shot["start"] < end]
+        offset += 0.2
+    return None
+
+
+def _shot_points(source, shot, text, ranks, seen, events, usage):
+    key = _shot_key(source, shot)
+    points = (40 - 4 * ranks[shot.get("gemini_key")]) if shot.get("gemini_key") in ranks else \
+             (40 - 4 * ranks[key]) if key in ranks else 0
+    points += SEMANTIC_WEIGHT * max(-2.0, min(3.0, seen.get(key, 0.0)))
+    if events and shot.get("event_id") in events:
+        points += 30
+    description = str(shot.get("description", ""))
+    points += _relevance(text, description) + _quality(shot)
+    repeat = usage.visual is not None and usage.visual.repeats(key, usage.used_hashes)
+    return points, repeat, key
+
+
+def _sequence_options(row, raw, text, seconds, usage, exact, match, ranks, seen, *, reuse, events):
+    """Windows over precise shots: each starts on a real cut and runs through its run."""
+    source = str(row["path"])
+    result = []
+    for index, shot in enumerate(raw):
+        found = _window(raw, index, seconds)
+        if found is None:
+            continue
+        start, covered = found
+        end = start + seconds
+        fresh = usage.fresh(source, start, seconds)
+        if not reuse and fresh < 0.999:
+            continue
+        if max(_number(item.get("motion")) for item in covered) > MAX_MOTION:
+            continue
+        scores, repeated, keys = [], False, []
+        for position, item in enumerate(covered):
+            share = min(end, item["end"]) - max(start, item["start"])
+            points, repeat, key = _shot_points(source, item, text, ranks, seen, events, usage)
+            # The opening shot lands on the narrated key word: it counts double.
+            scores.append((points, share * (2 if position == 0 else 1)))
+            repeated = repeated or repeat
+            keys.append(key)
+        if repeated and not reuse:
+            continue
+        weight = sum(w for _, w in scores) or 1.0
+        bonus = sum(p * w for p, w in scores) / weight - (40 if repeated else 0)
+        base = (100 * exact + 20 + match + bonus
+                - (2 if usage.last_source == source else 0)
+                - usage.source_seconds[source] / DIVERSITY_SECONDS)
+        if reuse:
+            base -= 30 * (1 - fresh) + (8 if usage.last_source == source else 0)
+        result.append((base, {"row": row, "start": start, "still": False, "image": False,
+                              "event_id": next((i.get("event_id") for i in covered if i.get("event_id")), None),
+                              "key": keys[0], "keys": keys, "reused": repeated or fresh < 0.999}))
+    return result
+
+
 def scene_catalogue(section: dict, paragraph, assets: dict, usage: UsageTracker, *, episode_ids=None) -> list[dict]:
     """In-scope scenes with descriptions, for Gemini to rank against one paragraph."""
     _, _, exact, generic, others = _pool(section, paragraph, assets, usage, episode_ids)
@@ -413,10 +521,15 @@ def scene_catalogue(section: dict, paragraph, assets: dict, usage: UsageTracker,
             continue
         source = str(row["path"])
         length = _number(row.get("duration"))
+        listed = set()
         for shot in usage.shots.get(source, _clean_shots(row.get("shots"), length)):
             if not shot.get("description"):
                 continue
-            catalogue.append({"key": _shot_key(source, shot), "description": str(shot["description"]),
+            key = shot.get("gemini_key") or _shot_key(source, shot)
+            if key in listed:
+                continue  # several precise shots share one logged scene
+            listed.add(key)
+            catalogue.append({"key": key, "description": str(shot["description"]),
                               "event": str(shot.get("event_summary") or ""),
                               "seconds": shot["end"] - shot["start"], "quality": shot.get("quality", 5),
                               "watermark": bool(shot.get("watermark")),
@@ -494,12 +607,17 @@ def plan_visuals(section: dict, paragraph, seconds: float, assets: dict, usage: 
                 "episode_id": row_ids[0] if len(row_ids) == 1 else None, "episode_ids": row_ids,
                 "scope": row.get("scope", "season"), "illustrative": bool(row.get("illustrative")),
                 "source_url": row.get("source_url", ""), "event_id": chosen.get("event_id"),
+                "reframe": (usage.beat % 5) + 1 if chosen.get("reused") else 0,
+                "crop_anchor": next((item.get("crop_anchor") for item in usage.shots.get(source, [])[:1]
+                                     if item.get("crop_anchor")), None),
                 "selection": "current-episode" if row_ids else
                              "other-season-fallback" if borrowed else
                              "orientation-footage" if season is None else "same-season-generic"}
         plan.append(shot)
-        if usage.visual is not None and chosen.get("key") in usage.visual.hashes:
-            usage.used_hashes.append(usage.visual.hashes[chosen["key"]])
+        if usage.visual is not None:
+            for used_key in chosen.get("keys") or [chosen.get("key")]:
+                if used_key in usage.visual.hashes:
+                    usage.used_hashes.append(usage.visual.hashes[used_key])
         usage.beat += 1
         usage.last_source = source
         if shot["still"]:
@@ -604,8 +722,8 @@ def plan_source_audio(section: dict, paragraph, assets: dict, usage: UsageTracke
             candidates.append((row, shots, True))
     for row, shots, linked in candidates:
         source = str(row["path"])
-        if not shots:
-            continue
+        if not shots or any(shot.get("crop_anchor") for shot in usage.shots.get(source, [])[:1]):
+            continue  # a clip with a burned-in overlay never plays uncropped
         if source not in usage.native_sources:
             if len(usage.native_sources) >= MAX_NATIVE_SOURCES:
                 return None

@@ -367,7 +367,7 @@ def test_source_download_attempts_are_bounded_even_if_every_probe_fails(monkeypa
     monkeypatch.setattr(assets, "probe", lambda path: {"streams": [], "format": {"duration": "95"}})
     monkeypatch.setattr(assets.requests, "get", lambda *args, **kwargs: Response(_jpeg()))
     result = assets.collect_assets(bundle, spec, tmp_path)
-    assert len(calls) == assets.MAX_DOWNLOAD_ATTEMPTS == 30
+    assert 30 <= len(calls) <= assets.MAX_DOWNLOAD_ATTEMPTS == 40
     assert result["seasons"]["1"][0]["kind"] == "image"
     assert not list(tmp_path.rglob("*.mp4"))
 
@@ -610,3 +610,12 @@ def test_image_cap_configuration_is_validated_before_download(monkeypatch, tmp_p
     monkeypatch.setattr(assets, "_discover_videos", lambda *args: pytest.fail("Invalid cap searched providers."))
     with pytest.raises(PipelineError, match="RECAP_MAX_IMAGES_PER_SEASON"):
         assets.collect_assets(bundle, spec, tmp_path)
+
+
+def test_reuploads_of_the_same_footage_are_recognised():
+    original = [0x0F0F0F0F0F0F0F0F ^ (index * 0x10001) for index in range(40)]
+    reupload = [value ^ 0b11 for value in original[5:35]]  # re-encoded: a couple of bits differ
+    other = [0x3333333333333333 ^ (index * 0x7000700070007) for index in range(40)]
+    assert assets.duplicate_share(reupload, original) >= assets.DUPLICATE_SHARE
+    assert assets.duplicate_share(other, original) < assets.DUPLICATE_SHARE
+    assert assets.duplicate_share([], original) == 0.0

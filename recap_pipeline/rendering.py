@@ -118,9 +118,39 @@ def _label(path, section, show_title=""):
     image.save(path)
 
 
-def _end_screen(path, show_title):
+def _end_screen_over_footage(timeline, overlay, seconds, output):
+    """The end screen plays over slowed, blurred footage from the recap, never a flat plate.
+
+    Returns False when no footage is usable; the caller then keeps the plain card.
+    """
+    shots = [shot for event in reversed(timeline) if event.get("type") == "narration"
+             for shot in event.get("shots", []) if not shot.get("still") and not shot.get("image")]
+    if not shots:
+        return False
+    shot = max(shots[:12], key=lambda item: item.get("duration", 0))
+    fps = render.FPS
+    frames = max(fps, round(seconds * fps))
+    width, height = render.export_size()
+    slow = max(1.0, seconds / max(0.5, float(shot.get("duration", 4.0))))
+    graph = (f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,"
+             f"setpts={slow:.3f}*(PTS-STARTPTS),fps={fps},tpad=stop_mode=clone:stop={frames},"
+             f"gblur=sigma=22,eq=brightness=-0.18:saturation=0.8[bg];"
+             f"[1:v]scale={width}:{height}[fg];[bg][fg]overlay=0:0:format=auto,setpts=N/({fps}*TB)[v];[2:a]apad[a]")
+    try:
+        ffmpeg("-ss", shot["start"], "-t", float(shot.get("duration", 4.0)), "-i", shot["source"],
+               "-loop", "1", "-framerate", fps, "-i", overlay,
+               "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+               "-filter_complex", graph, "-map", "[v]", "-map", "[a]", "-frames:v", frames, "-t", frames / fps,
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-r", fps,
+               "-threads", "2", *render.LOSSLESS_AUDIO, output)
+    except (OSError, PipelineError):
+        return False
+    return Path(output).is_file()
+
+
+def _end_screen(path, show_title, *, transparent=False):
     """Keep space clear for the platform's end-screen video and subscribe links."""
-    canvas = Image.new("RGB", (1280, 720), "#101923")
+    canvas = Image.new("RGBA", (1280, 720), (0, 0, 0, 0)) if transparent else Image.new("RGB", (1280, 720), "#101923")
     draw = ImageDraw.Draw(canvas)
     draw.text((640, 95), "THANKS FOR WATCHING", anchor="mm",
               font=render.brand_font("display", 58), fill="white")
@@ -435,10 +465,13 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
                                 native_inserted = True
             if not any(event["type"] == "narration" for event in timeline):
                 raise PipelineError("A recap cannot export without complete verified narration.")
-            end_plate = work / "end-screen.png"
-            _end_screen(end_plate, script.get("show_title") or _value(spec, "show_title"))
             end_part = work / "end-screen.mp4"
-            render.end_screen_video(end_plate, END_SCREEN_SECONDS, end_part)
+            overlay = work / "end-screen-overlay.png"
+            _end_screen(overlay, script.get("show_title") or _value(spec, "show_title"), transparent=True)
+            if not _end_screen_over_footage(timeline, overlay, END_SCREEN_SECONDS, end_part):
+                end_plate = work / "end-screen.png"
+                _end_screen(end_plate, script.get("show_title") or _value(spec, "show_title"))
+                render.end_screen_video(end_plate, END_SCREEN_SECONDS, end_part)
             chapters.append({"start": clock, "title": "Thanks for watching", "section_id": "end-screen"})
             timeline.append({"type": "end-screen", "start": clock, "duration": _part_seconds(end_part), "shots": []})
             parts.append(end_part)

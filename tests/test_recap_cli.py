@@ -60,7 +60,7 @@ def services(monkeypatch, tmp_path):
         footages.append(footage)
         return _script(kind)
 
-    def collect(bundle, spec, cache):
+    def collect(bundle, spec, cache, ledger=None):
         events.append(("assets",))
         cache.mkdir(parents=True, exist_ok=True)
         image = cache / "still.jpg"

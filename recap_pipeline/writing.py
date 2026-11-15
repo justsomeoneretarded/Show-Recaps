@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections import defaultdict
@@ -13,7 +14,7 @@ from movie_pipeline.core import PipelineError, key, save_json
 from recap_pipeline.gemini import GeminiClient, GeminiUnavailable, configured_key
 from recap_pipeline.models import MAX_VIDEO_MINUTES, narration_within_scope, voice_speed_value
 
-POLICY_VERSION = 9
+POLICY_VERSION = 10
 WORDS_PER_SECOND = 2.7  # measured 2.9 in production; lower keeps the estimate long
 FIXED_SECONDS = 20.0  # end screen, holds and title beats
 MAX_EPISODES_PER_BATCH = 6
@@ -600,6 +601,25 @@ def _write_section(writer, cache_dir, kind, purpose, season, events, spec, previ
     return result
 
 
+LATEST_SEASON_WEIGHT = 1.6
+
+
+def _chapters(events, kind):
+    """Story sections that follow episode boundaries: each becomes a titled chapter.
+
+    A season recap gets about three chapters, a series recap two per season;
+    a chapter never splits an episode unless it is too large for one request.
+    """
+    episodes = list(dict.fromkeys(event["episode_id"] for event in events))
+    if not episodes:
+        return
+    groups = 3 if kind == "season" else 2
+    per = max(1, math.ceil(len(episodes) / groups))
+    for start in range(0, len(episodes), per):
+        chosen = set(episodes[start:start + per])
+        yield from _batch([event for event in events if event["episode_id"] in chosen])
+
+
 def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None, footage=None):
     """Write a detailed previous-season recap or the linked story of all earlier seasons."""
     if kind not in {"season", "series"}:
@@ -653,7 +673,8 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None, footage=None
     previous = ""
     previous_events = []
     missing_seasons = []
-    weight = lambda number: 1.15 if kind == "series" and number == upcoming - 1 else 1.0
+    # The season just before the new one matters most to a viewer catching up: it gets more time.
+    weight = lambda number: LATEST_SEASON_WEIGHT if kind == "series" and number == upcoming - 1 else 1.0
     total_weight = sum(len(items) * weight(number) for number, items in by_season.items()) + len(ending_events)
     try:
         requested_minutes = float(_spec_value(spec, kind + "_minutes", "Auto"))
@@ -679,7 +700,7 @@ def write_recap(kind, spec, bundle, ledger, cache_dir, writer=None, footage=None
             missing_seasons.append(season)
             warnings.append(f"Season {season} has no verified story events and could not be narrated.")
             continue
-        for index, batch in enumerate(_batch(material)):
+        for index, batch in enumerate(_chapters(material, kind)):
             result = _write_section(writer, cache_dir, kind, "story", season, batch, spec, previous,
                                     previous_events, bundle.get("research_quality", {}),
                                     runtime_share=share(len(batch), season),
