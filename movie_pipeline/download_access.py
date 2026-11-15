@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 
-_state = {"prefer_fallback": False}
+_state = {"prefer_fallback": False, "blocked": set()}
 
 
 def fallback_proxy() -> str:
@@ -45,5 +45,17 @@ def record_route_success(route: str):
         _state["prefer_fallback"] = True
 
 
+def mark_blocked(route: str):
+    """A route that refused the runner stays skipped for the rest of the run."""
+    _state["blocked"].add(route)
+    if route == "direct" and fallback_proxy():
+        _state["prefer_fallback"] = True
+
+
+def blocked_routes() -> set:
+    return set(_state["blocked"])
+
+
 def reset():
     _state["prefer_fallback"] = False
+    _state["blocked"] = set()

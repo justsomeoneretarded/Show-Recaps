@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from urllib.parse import urlparse
@@ -107,21 +108,188 @@ def _request(client, show, season, episodes):
     return plots, sources
 
 
-def deepen(bundle: dict, cache_dir: Path, client=None) -> dict:
-    """Add verified, web-researched detailed plots to every episode that can get one."""
-    if client is None:
-        if not configured_key():
-            return bundle
-        client = GeminiClient()
-    show = bundle.get("show") or {}
+FANDOM_PLOT = re.compile(r"\b(plot|synopsis|summary|recap|story)\b", re.I)
+FANDOM_TIMEOUT = 20
+USER_AGENT = "show-recaps research bot (episode plot lookup; contact via the repository)"
+
+
+def _slug(text):
+    return re.sub(r"[^a-z0-9]", "", str(text).casefold())
+
+
+def _plain_html(html):
+    from .research import _plain
+    html = re.sub(r"<(aside|table|figure|style|script)\b.*?</\1>", " ", html, flags=re.S | re.I)
+    html = re.sub(r"<sup\b.*?</sup>", "", html, flags=re.S | re.I)
+    return " ".join(_plain(html).split())
+
+
+class Fandom:
+    """Episode plots from the show's Fandom wiki through its public MediaWiki API."""
+
+    def __init__(self, show, session=None):
+        import requests
+        self.session = session or requests.Session()
+        self.show = show
+        self.base = None
+        self.wiki = ""
+
+    def _get(self, base, **params):
+        response = self.session.get(base + "/api.php", params={**params, "format": "json", "formatversion": 2},
+                                    headers={"User-Agent": USER_AGENT}, timeout=FANDOM_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
+
+    def find_wiki(self):
+        title = str(self.show.get("title") or "")
+        words = title.split()
+        names = [_slug(title), _slug(" ".join(words[1:])) if words[:1] and words[0].casefold() == "the" else "",
+                 _slug(title) + "tv", _slug(title) + "series"]
+        for name in dict.fromkeys(n for n in names if n):
+            base = f"https://{name}.fandom.com"
+            try:
+                site = self._get(base, action="query", meta="siteinfo").get("query", {}).get("general", {})
+            except Exception:
+                continue
+            if _slug(title) in _slug(site.get("sitename", "")):
+                self.base, self.wiki = base, f"{name}.fandom.com"
+                return True
+        return False
+
+    def plot(self, season, episode):
+        """(plot text, page url) for one episode, or None when the wiki cannot confirm it."""
+        title = str(episode.get("title") or "")
+        try:
+            found = self._get(self.base, action="query", list="search", srsearch=title, srlimit=8,
+                              srnamespace=0).get("query", {}).get("search", [])
+        except Exception:
+            return None
+        wanted = _slug(title)
+        pages = [row.get("title", "") for row in found
+                 if _slug(re.sub(r"\s*\(.*?\)\s*$", "", row.get("title", ""))) == wanted]
+        for page in pages[:2]:
+            try:
+                parsed = self._get(self.base, action="parse", page=page, prop="text", redirects=1,
+                                   disableeditsection=1)
+            except Exception:
+                continue
+            html = (parsed.get("parse") or {}).get("text") or ""
+            if isinstance(html, dict):
+                html = html.get("*", "")
+            # The episode infobox must name this season and episode number: a novel or
+            # character page with the same title never qualifies.
+            boxes = re.findall(r"<aside\b.*?</aside>", html, flags=re.S | re.I)
+            header = " ".join(_plain_html(box.replace("<aside", "<div").replace("</aside>", "</div>"))
+                              for box in boxes) or _plain_html(html[:4000])
+            number = int(episode["number"])
+            label = r"\W{0,12}(?:no\.?|number|#)?\W{0,12}0*"
+            coded = re.search(rf"\bs0*{int(season)}\s*e0*{number}\b|\b0*{int(season)}x0*{number}\b", header, re.I)
+            if not coded and not (re.search(rf"season{label}{int(season)}\b", header, re.I)
+                                  and re.search(rf"episode{label}{number}\b", header, re.I)):
+                continue
+            parts = re.split(r"(<h2\b.*?</h2>)", html, flags=re.S | re.I)
+            text = ""
+            for index in range(1, len(parts) - 1, 2):
+                if FANDOM_PLOT.search(_plain_html(parts[index])):
+                    text = _plain_html(parts[index + 1])
+                    break
+            text = re.sub(r"\[\s*edit\s*\]", "", text).strip()
+            if text:
+                return text, f"{self.base}/wiki/" + page.replace(" ", "_")
+        return None
+
+
+def _attach(bundle, season, episode, plot, source_id, url, label):
     sources = bundle.setdefault("sources", [])
+    show = bundle.get("show") or {}
+    if source_id not in {s.get("id") for s in sources}:
+        sources.append({"id": source_id, "url": url,
+                        "title": (f"{show.get('title')} — S{int(season):02}E{int(episode['number']):02} "
+                                  f"detailed plot ({label})"),
+                        "season": season, "episode": episode["number"]})
+    previous = str(episode.get("summary") or "")
+    episode["summary"] = (previous + "\n\n" + plot).strip() if previous else plot
+    episode.setdefault("source_texts", {})[source_id] = plot
+    episode["summary_source_ids"] = list(dict.fromkeys([*episode.get("summary_source_ids", []), source_id]))
+    episode["sources"] = list(dict.fromkeys([*episode.get("sources", []), source_id]))
+    episode["summary_depth"] = "detailed_plot"
+    episode["detailed_plot_available"] = True
+    episode["summary_source_type"] = episode.get("summary_source_type") or "web_research"
+
+
+def _usable(plot, episode):
+    words = len(str(plot).split())
+    return MIN_WORDS <= words <= MAX_WORDS * 3 and agrees(plot, episode.get("summary", ""))
+
+
+def _fandom_plots(bundle, cache_dir, session=None):
+    """Plots from the show's Fandom wiki; cached per show. Returns the number attached."""
+    show = bundle.get("show") or {}
+    path = Path(cache_dir) / f"fandom-{_slug(show.get('title'))}-{show.get('id')}-v{VERSION}.json"
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cached = None
+    if cached is None:
+        cached = {"wiki": "", "plots": {}}
+        if os.getenv("RECAP_FANDOM", "on").strip().lower() != "off":
+            fandom = Fandom(show, session)
+            try:
+                found = fandom.find_wiki()
+            except Exception:
+                found = False
+            if found:
+                cached["wiki"] = fandom.wiki
+                for season in bundle.get("seasons", []):
+                    for episode in season.get("episodes", []):
+                        result = fandom.plot(season["number"], episode)
+                        if result:
+                            cached["plots"][str(episode["id"])] = list(result)
+        try:
+            save_json(path, cached)
+        except OSError:
+            pass
+    kept = 0
+    for season in bundle.get("seasons", []):
+        for episode in season.get("episodes", []):
+            found = cached["plots"].get(str(episode["id"]))
+            if not found:
+                continue
+            plot, url = found
+            # Long wiki plots are kept whole up to three times the usual length; beyond that,
+            # the opening part (where the episode's main turns are) is used.
+            words = str(plot).split()
+            plot = " ".join(words[:MAX_WORDS * 3])
+            if not _usable(plot, episode):
+                continue
+            _attach(bundle, season["number"], episode, plot,
+                    f"fandom:{show.get('id')}:{season['number']}:{episode['number']}", url, cached["wiki"])
+            kept += 1
+    return kept
+
+
+def deepen(bundle: dict, cache_dir: Path, client=None, *, session=None) -> dict:
+    """Add verified detailed plots: the show's wiki first, then Gemini web research for the rest."""
+    show = bundle.get("show") or {}
     warnings = bundle.setdefault("warnings", [])
     cache_dir = Path(cache_dir)
+    total = sum(len(s.get("episodes", [])) for s in bundle.get("seasons", []))
+    try:
+        from_wiki = _fandom_plots(bundle, cache_dir, session)
+    except Exception as exc:  # optional research must never stop a run
+        print(f"Wiki research unavailable ({type(exc).__name__}).", flush=True)
+        from_wiki = 0
+    if from_wiki:
+        warnings.append(f"The show's wiki supplied verified detailed plots for {from_wiki} of {total} episodes.")
+    if client is None and configured_key() and os.getenv("RECAP_WRITER", "auto").strip().lower() != "local":
+        client = GeminiClient()
     kept = attempted = 0
-    for season in bundle.get("seasons", []):
-        episodes = season.get("episodes", [])
-        for index in range(0, len(episodes), BATCH):
-            batch = episodes[index:index + BATCH]
+    for season in bundle.get("seasons", []) if client is not None else []:
+        # Episodes the wiki already covered need no web search.
+        missing = [e for e in season.get("episodes", [])
+                   if not any(str(i).startswith("fandom:") for i in e.get("summary_source_ids", []))]
+        for index in range(0, len(missing), BATCH):
+            batch = missing[index:index + BATCH]
             identity = {"version": VERSION, "model": client.model, "show": show.get("id"),
                         "season": season["number"],
                         "episodes": [[e["id"], e["number"], e["title"], e.get("summary", "")] for e in batch]}
@@ -132,46 +300,35 @@ def deepen(bundle: dict, cache_dir: Path, client=None) -> dict:
                 plots = {int(k): v for k, v in cached["plots"].items()}
                 web = cached["sources"]
             except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                if getattr(client, "unavailable", False):
+                    break
                 attempted += 1
                 try:
                     plots, web = _request(client, show, season["number"], batch)
                 except (GeminiUnavailable, NotGrounded, PipelineError) as exc:
-                    print(f"Deep research skipped for season {season['number']} "
-                          f"({type(exc).__name__}).", flush=True)
+                    print(f"Web research skipped for season {season['number']} ({type(exc).__name__}).", flush=True)
+                    if isinstance(exc, GeminiUnavailable):
+                        client.unavailable = True  # e.g. no search quota on this key: do not keep asking
                     continue
                 save_json(path, {"plots": plots, "sources": web})
             domains = list(dict.fromkeys(d for d in (_domain(s) for s in web) if d))[:4]
             for episode in batch:
                 plot = plots.get(int(episode["number"]), "")
-                words = len(plot.split())
-                if not MIN_WORDS <= words <= MAX_WORDS or not agrees(plot, episode.get("summary", "")):
+                if not MIN_WORDS <= len(plot.split()) <= MAX_WORDS or not agrees(plot, episode.get("summary", "")):
                     continue
-                source_id = f"web:{show.get('id')}:{season['number']}:{episode['number']}"
-                if source_id not in {s.get("id") for s in sources}:
-                    sources.append({"id": source_id,
-                                    "url": f"https://{domains[0]}" if domains else str(web[0].get("uri", "")),
-                                    "title": (f"{show.get('title')} — S{int(season['number']):02}"
-                                              f"E{int(episode['number']):02} detailed plot (web research: "
-                                              + (", ".join(domains) or "search results") + ")"),
-                                    "season": season["number"], "episode": episode["number"]})
-                previous = str(episode.get("summary") or "")
-                episode["summary"] = (previous + "\n\n" + plot).strip() if previous else plot
-                episode.setdefault("source_texts", {})[source_id] = plot
-                episode["summary_source_ids"] = list(dict.fromkeys([*episode.get("summary_source_ids", []),
-                                                                    source_id]))
-                episode["sources"] = list(dict.fromkeys([*episode.get("sources", []), source_id]))
-                episode["summary_depth"] = "detailed_plot"
-                episode["detailed_plot_available"] = True
-                episode["summary_source_type"] = episode.get("summary_source_type") or "web_research"
+                _attach(bundle, season["number"], episode, plot,
+                        f"web:{show.get('id')}:{season['number']}:{episode['number']}",
+                        f"https://{domains[0]}" if domains else str(web[0].get("uri", "")),
+                        "web research: " + (", ".join(domains) or "search results"))
                 kept += 1
-    total = sum(len(s.get("episodes", [])) for s in bundle.get("seasons", []))
     if kept:
         warnings.append(f"Web research added verified detailed plots for {kept} of {total} episodes.")
-    elif attempted:
+    elif attempted and not from_wiki:
         warnings.append("Web research found no verified detailed plots; episode summaries were used as they are.")
-    try:
-        from .research import _quality
-        bundle["research_quality"] = _quality(bundle.get("seasons", []))
-    except Exception:
-        pass
+    if kept or from_wiki:
+        try:
+            from .research import _quality
+            bundle["research_quality"] = _quality(bundle.get("seasons", []))
+        except Exception:
+            pass
     return bundle

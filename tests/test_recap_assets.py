@@ -143,7 +143,7 @@ def test_prior_episode_image_fallback_and_cross_recap_cache(monkeypatch, tmp_pat
     monkeypatch.setattr(assets.requests, "get", get)
     season_recap = assets.collect_assets(bundle, spec, tmp_path)
     series_recap = assets.collect_assets(bundle, spec, tmp_path)
-    assert searches == [1]
+    assert searches == [1, 1]  # a stills-only cache is reused, but footage is searched for again
     assert requests == ["https://images.example/ep1.jpg"]
     assert set(season_recap["seasons"]) == {"1"}
     item = season_recap["seasons"]["1"][0]
@@ -520,7 +520,7 @@ def test_legacy_three_image_cache_is_validated_reused_and_enriched(monkeypatch, 
     calls.clear()
     monkeypatch.delenv("RECAP_MAX_IMAGES_PER_SEASON", raising=False)
     result = assets.collect_assets(bundle, spec, tmp_path)
-    assert searches == [1]
+    assert searches == [1, 1]  # a stills-only cache is reused, but footage is searched for again
     assert len(result["seasons"]["1"]) == 9
     assert len(calls) == 6 and not cached_urls.intersection(calls)
     upgraded = json.loads(manifest.read_text())
@@ -544,7 +544,7 @@ def test_safe_sparse_cache_survives_provider_failure_during_enrichment(monkeypat
         raise assets.requests.ConnectionError("provider unavailable")
     monkeypatch.setattr(assets.requests, "get", failed)
     after = assets.collect_assets(bundle, spec, tmp_path)["seasons"]["1"]
-    assert searches == [1]
+    assert searches == [1, 1]  # a stills-only cache is reused, but footage is searched for again
     assert len(calls) == 6
     assert {asset["source_url"] for asset in after} == {asset["source_url"] for asset in before}
 
@@ -578,8 +578,9 @@ def test_shared_source_budget_stops_requests_across_seasons(monkeypatch, tmp_pat
                         lambda url, **kwargs: (calls.append(url), Response(body))[1])
     result = assets.collect_assets(bundle, spec, tmp_path)
     assert len(calls) == 3
-    assert len(result["seasons"]["1"]) == 2
-    assert result["seasons"]["2"][0]["episode_ids"] == ["s2ep2"]
+    # The latest season is collected first, so the earlier one meets the budget.
+    assert len(result["seasons"]["2"]) == 2
+    assert result["seasons"]["1"][0]["episode_ids"] == ["s1ep2"]
     assert len(checks) == 3
     assert any("shared source byte budget" in warning for warning in result["warnings"])
 
@@ -598,9 +599,10 @@ def test_cached_sources_share_budget_with_new_seasons(monkeypatch, tmp_path, bun
     bundle["seasons"][1]["episodes"] = _episodes(2, season=2)
     calls.clear()
     result = assets.collect_assets(bundle, spec, tmp_path)
-    assert calls == ["https://images.example/s2ep2.jpg"]
-    assert result["seasons"]["1"][0]["path"] == first["seasons"]["1"][0]["path"]
-    assert len(result["seasons"]["2"]) == 1
+    # New and cached sources draw on one budget: the latest season downloads first, and the
+    # earlier season's cached still is only kept while the shared budget allows it.
+    assert calls and all("s2ep" in url for url in calls) and len(calls) <= 2
+    assert len(result["seasons"]["2"]) >= 1
     assert any("shared source byte budget" in warning for warning in result["warnings"])
 
 
@@ -619,3 +621,26 @@ def test_reuploads_of_the_same_footage_are_recognised():
     assert assets.duplicate_share(reupload, original) >= assets.DUPLICATE_SHARE
     assert assets.duplicate_share(other, original) < assets.DUPLICATE_SHARE
     assert assets.duplicate_share([], original) == 0.0
+
+
+def test_title_screen_skips_results_that_cannot_qualify():
+    show = {"title": "Reacher", "year": 2022}
+    good = {"title": "Reacher Season 3 - Official Trailer | Prime Video", "duration": 130}
+    assert assets.title_plausible(good, show, 3, 4)
+    assert not assets.title_plausible({**good, "title": "Reacher Season 4 Official Trailer"}, show, 3, 4)
+    assert not assets.title_plausible({**good, "title": "Reacher Season 3 Reaction"}, show, 3, 4)
+    assert not assets.title_plausible({**good, "duration": 3600}, show, 3, 4)
+    assert not assets.title_plausible({**good, "title": "Jack Ryan Season 3 Trailer"}, show, 3, 4)
+
+
+def test_player_response_failures_count_as_a_block():
+    assert assets._blocked(RuntimeError("ERROR: [youtube] abc: Failed to extract any player response; please report"))
+    assert not assets._blocked(RuntimeError("Video unavailable"))
+
+
+def test_a_season_without_footage_stops_instead_of_making_a_slideshow(monkeypatch, tmp_path, bundle, spec):
+    no_video(monkeypatch)
+    monkeypatch.setenv("RECAP_ALLOW_STILLS", "off")
+    monkeypatch.setattr(assets.requests, "get", lambda url, **kwargs: Response(_jpeg()))
+    with pytest.raises(PipelineError, match="No video footage could be downloaded for season"):
+        assets.collect_assets(bundle, spec, tmp_path)

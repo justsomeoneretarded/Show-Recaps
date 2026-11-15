@@ -77,8 +77,7 @@ def research_stage(shared):
     shared = Path(shared)
     spec = load_spec(shared, create=True)
     bundle = research_show(spec, shared / "research-cache")
-    if os.getenv("RECAP_DEEP_RESEARCH", "on").strip().lower() != "off" \
-            and os.getenv("RECAP_WRITER", "auto").strip().lower() != "local":
+    if os.getenv("RECAP_DEEP_RESEARCH", "on").strip().lower() != "off":
         from .deep_research import deepen
         bundle = deepen(bundle, shared / "research-cache")
     save_json(shared / "research.json", bundle)

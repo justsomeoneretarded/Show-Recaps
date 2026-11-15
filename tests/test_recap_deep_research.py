@@ -83,3 +83,55 @@ def test_research_is_cached(tmp_path):
 
 def test_no_key_means_no_change(tmp_path):
     assert deep_research.deepen(bundle(), tmp_path) == bundle()
+
+
+class FakeWiki:
+    """A tiny MediaWiki API: one wiki, one episode page with an infobox and a Plot section."""
+
+    def __init__(self, plot_html, season_text="Season 3"):
+        self.plot_html, self.season_text, self.urls = plot_html, season_text, []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.urls.append(url)
+        class Response:
+            def __init__(self, data, status=200):
+                self.data, self.status_code = data, status
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError("missing")
+            def json(self):
+                return self.data
+        if not url.startswith("https://reacher.fandom.com"):
+            return Response({}, 404)
+        if params.get("meta") == "siteinfo":
+            return Response({"query": {"general": {"sitename": "Reacher Wiki"}}})
+        if params.get("list") == "search":
+            return Response({"query": {"search": [{"title": "Persuader (episode)"}, {"title": "Persuader (novel)"}]}})
+        if params.get("action") == "parse":
+            html = (f'<aside class="portable-infobox">{self.season_text}, Episode 1</aside>'
+                    '<p>Intro.</p><h2><span id="Plot">Plot</span></h2>' + self.plot_html
+                    + '<h2><span id="Cast">Cast</span></h2><p>Alan Ritchson</p>')
+            return Response({"parse": {"text": html}})
+        return Response({}, 404)
+
+
+def test_wiki_plot_is_found_verified_and_cited(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECAP_FANDOM", "on")
+    plot = "<p>" + " ".join(["Reacher stages the rescue of Richard Beck for Duffy.",
+                             "Zachary Beck hires him after Russian roulette.",
+                             "Teresa Daniels was held in the cellar."] * 10) + "<sup>[1]</sup></p>"
+    wiki = FakeWiki(plot)
+    result = deep_research.deepen(bundle(), tmp_path, session=wiki)
+    first = result["seasons"][0]["episodes"][0]
+    assert first["summary_depth"] == "detailed_plot" and "Teresa Daniels was held in the cellar." in first["summary"]
+    assert "[1]" not in first["summary"] and "Alan Ritchson" not in first["summary"]
+    source = next(s for s in result["sources"] if s["id"] == "fandom:7:3:1")
+    assert source["url"] == "https://reacher.fandom.com/wiki/Persuader_(episode)"
+    assert "reacher.fandom.com" in source["title"]
+
+
+def test_wiki_page_from_another_season_is_not_used(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECAP_FANDOM", "on")
+    plot = "<p>" + "Reacher meets Richard Beck and Zachary Beck and Duffy and Teresa Daniels. " * 20 + "</p>"
+    result = deep_research.deepen(bundle(), tmp_path, session=FakeWiki(plot, season_text="Season 1"))
+    assert result["seasons"][0]["episodes"][0]["summary"] == SUMMARY

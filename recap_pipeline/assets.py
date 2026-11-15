@@ -204,9 +204,46 @@ def _url(entry: dict) -> str | None:
     return None
 
 
+BLOCK_PHRASES = ("confirm you're not a bot", "sign in", "login required", "http error 429",
+                 # YouTube's answer to a flagged runner: no player response at all.
+                 "failed to extract any player response", "too many requests", "rate-limit", "rate limit")
+MAX_CONSECUTIVE_FAILURES = 5   # metadata lookups failing in a row on one route means it is blocked
+REQUEST_PAUSE = (1.5, 4.0)     # seconds between YouTube requests: steady, not bursty
+
+
 def _blocked(exc: Exception) -> bool:
     text = str(exc).casefold().replace("’", "'")
-    return any(phrase in text for phrase in ("confirm you're not a bot", "sign in", "login required", "http error 429"))
+    return any(phrase in text for phrase in BLOCK_PHRASES)
+
+
+def _pause():
+    import random
+    import time
+    if os.getenv("RECAP_YOUTUBE_PAUSE", "on").strip().lower() != "off":
+        time.sleep(random.uniform(*REQUEST_PAUSE))
+
+
+def title_plausible(entry: dict, show: dict, season: int, upcoming_season: int) -> bool:
+    """Cheap check on a search result's title and length before asking YouTube for the video.
+
+    Full metadata requests are what get a runner flagged, so only results that
+    could pass candidate_ok are looked up.
+    """
+    title = str(entry.get("title") or "")
+    if not title:
+        return True  # nothing to judge from: the full metadata check decides
+    if REJECT.search(title) or not PROMO.search(title):
+        return False
+    if not _show_named(title, str(show.get("title") or "")):
+        return False
+    refs = _season_numbers(title)
+    if refs and refs != {season}:
+        return False
+    try:
+        seconds = float(entry.get("duration") or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    return not seconds or 8 <= seconds <= 480
 
 
 class _Budget:
@@ -322,12 +359,16 @@ def _discover_videos(show: dict, season: dict, incoming: int, root: Path,
             "socket_timeout": 20, "retries": 1, "fragment_retries": 1,
             "js_runtimes": {"node": {}}, "cachedir": False}
     for route in download_access.routes()[:2]:
+        if route in download_access.blocked_routes():
+            continue  # blocked earlier in this run: do not spend minutes per title finding out again
         common = download_access.options(base, route)
         blocked = False
+        failures = 0
         for query in _all_queries(show, season, client):
             if blocked or len(seen) >= MAX_CANDIDATES or attempts >= max_attempts or len(accepted) >= max_videos:
                 break
             try:
+                _pause()
                 with yt_dlp.YoutubeDL({**common, "extract_flat": True}) as ydl:
                     results = ydl.extract_info(f"ytsearch{SEARCH_RESULTS}:{query}", download=False) or {}
             except (yt_dlp.utils.DownloadError, OSError, ValueError) as exc:
@@ -342,12 +383,22 @@ def _discover_videos(show: dict, season: dict, incoming: int, root: Path,
                 url = _url(entry)
                 if not url or url in seen:
                     continue
+                if not title_plausible(entry, show, number, incoming):
+                    seen.add(url)
+                    continue
+                if TRAILER.search(str(entry.get("title") or "")) and sum(
+                        1 for item in accepted if TRAILER.search(item["title"])) >= MAX_TRAILERS:
+                    seen.add(url)
+                    continue
                 # A blocked route may retry this URL on the next configured route.
                 try:
+                    _pause()
                     with yt_dlp.YoutubeDL(common) as ydl:
                         info = ydl.extract_info(url, download=False) or {}
+                    failures = 0
                 except (yt_dlp.utils.DownloadError, OSError, ValueError) as exc:
-                    blocked = _blocked(exc)
+                    failures += 1
+                    blocked = _blocked(exc) or failures >= MAX_CONSECUTIVE_FAILURES
                     if not blocked:
                         seen.add(url)
                     continue
@@ -416,6 +467,7 @@ def _discover_videos(show: dict, season: dict, incoming: int, root: Path,
                             seen.discard(url)
         if len(accepted) >= max_videos or not blocked:
             break
+        download_access.mark_blocked(route)
         warnings.append(f"Season {number}: optional video provider blocked the {route} route; trying available fallback sources.")
     return [{k: v for k, v in item.items() if k != "_signature"} for item in accepted]
 
@@ -760,20 +812,25 @@ def collect_assets(bundle: dict, spec, cache_dir: Path, ledger: dict | None = No
     client = shared_client()
     prior = [row for row in bundle.get("seasons") or [] if 0 < int(row["number"]) < incoming]
     windows = season_windows(prior)
-    for season in sorted(prior, key=lambda row: int(row["number"])):
+    # The latest season first: it carries the season recap and the ending, so it gets the
+    # downloads before YouTube can grow wary of the runner.
+    for season in sorted(prior, key=lambda row: -int(row["number"])):
         number = int(season["number"])
         season_root = root / f"season-{number:02}"
         season_root.mkdir(parents=True, exist_ok=True)
         manifest = season_root / "assets.json"
         window = windows.get(number)
         cached = _cached(manifest, show, season, incoming, window)
+        stills = None
+        if cached is not None and not any(asset.get("kind") == "video" for asset in cached):
+            stills, cached = cached, None  # stills from a blocked run: look for real footage again
         if cached is None:
             assets = _discover_videos(show, season, incoming, season_root,
                                       2160 if spec.try_4k else 1080, budget, result["warnings"],
                                       client, window)
             if not assets:
                 assets = _fallback_images(show, season, season_root, budget, result["warnings"],
-                                          limit=image_limit)
+                                          cached=stills, limit=image_limit)
         elif all(asset.get("kind") == "video" for asset in cached):
             assets = []
             for asset in cached:
@@ -803,6 +860,14 @@ def collect_assets(bundle: dict, spec, cache_dir: Path, ledger: dict | None = No
                                  for asset in assets if asset.get("source_url"))
     if not result["seasons"]:
         raise PipelineError("No researched prior seasons are available for recap visuals.")
+    result["seasons"] = dict(sorted(result["seasons"].items(), key=lambda item: int(item[0])))
+    without = [key for key, rows in result["seasons"].items() if not any(r.get("kind") == "video" for r in rows)]
+    if without and os.getenv("RECAP_ALLOW_STILLS", "off").strip().lower() != "on":
+        # A recap told over episode stills is a slideshow; stop before hours of rendering.
+        raise PipelineError(
+            "No video footage could be downloaded for season(s) " + ", ".join(without)
+            + ". YouTube refused the runner (see the log). Refresh the YOUTUBE_COOKIES secret or run again "
+              "later; set the repository variable RECAP_ALLOW_STILLS=on to accept episode stills instead.")
     if not any(result["seasons"].values()):
         raise PipelineError("No footage or imagery could be downloaded for any covered season. "
                             "Add or refresh the YOUTUBE_COOKIES secret and run again; no blank-plate video is made.")

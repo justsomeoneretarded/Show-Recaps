@@ -166,8 +166,28 @@ jobs:
         # Also the automatic fallback when Gemini's free quota runs out; skipped only for Gemini-only runs.
         if: vars.RECAP_WRITER != 'gemini'
         run: bash scripts/bootstrap_ollama.sh
+      - name: Footage cache key
+        id: footage
+        env:
+          TITLE: ${{ inputs.show_title }}
+          YEAR: ${{ inputs.premiere_year }}
+        run: echo "key=recap-footage-v1-$(printf '%s' "$TITLE" | tr 'A-Z' 'a-z' | tr -cs 'a-z0-9' '-')-$YEAR" >> "$GITHUB_OUTPUT"
+      - name: Restore footage downloaded by earlier runs
+        # YouTube can refuse a runner after a burst of downloads; clips (and Gemini's logs of
+        # them) downloaded once are reused instead of fetched again.
+        uses: actions/cache/restore@v4
+        with:
+          path: work/shared/asset-cache
+          key: ${{ steps.footage.outputs.key }}-${{ github.run_id }}
+          restore-keys: ${{ steps.footage.outputs.key }}-
       - name: Research once, write both recaps, collect scoped assets
         run: python -m recap_pipeline.cli --stage prepare
+      - name: Save downloaded footage for later runs
+        if: always() && hashFiles('work/shared/asset-cache/**/*.mp4') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: work/shared/asset-cache
+          key: ${{ steps.footage.outputs.key }}-${{ github.run_id }}
       - name: Package shared research and assets
         run: tar -czf recap-shared.tgz work/shared
       - uses: actions/upload-artifact@v4
