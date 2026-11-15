@@ -21,6 +21,10 @@ class Response:
             raise requests.HTTPError(str(self.status_code))
 
 
+# A 429 that names no quota: a few refill waits, then the usual attempts.
+UNKNOWN_429_CALLS = gemini.MAX_ATTEMPTS + gemini.MAX_QUOTA_WAITS // 2
+
+
 def ok(value, **candidate):
     return Response(payload={"candidates": [{
         "finishReason": "STOP",
@@ -78,10 +82,10 @@ def test_truncated_or_invalid_output_is_retried():
 
 
 def test_persistent_quota_failure_is_reported_as_unavailable():
-    c, session, sleeps = client(*[Response(429) for _ in range(gemini.MAX_ATTEMPTS)])
+    c, session, sleeps = client(*[Response(429) for _ in range(UNKNOWN_429_CALLS)])
     with pytest.raises(GeminiUnavailable, match="HTTP 429"):
         c.generate_json("s", "p", {"type": "object"})
-    assert len(sleeps) == gemini.MAX_ATTEMPTS - 1 and max(sleeps) <= gemini.MAX_BACKOFF_SECONDS
+    assert len(sleeps) == UNKNOWN_429_CALLS - 1 and max(sleeps) <= gemini.MAX_BACKOFF_SECONDS
 
 
 def test_bad_key_fails_fast_without_retrying_or_falling_back():
@@ -163,7 +167,7 @@ def test_provider_selection_from_environment(monkeypatch):
 
 
 def test_after_an_exhausted_retry_cycle_no_further_calls_are_made():
-    c, session, sleeps = client(*[Response(429) for _ in range(gemini.MAX_ATTEMPTS)])
+    c, session, sleeps = client(*[Response(429) for _ in range(UNKNOWN_429_CALLS)])
     with pytest.raises(GeminiUnavailable):
         c.generate_json("s", "p", {"type": "object"})
     calls = len(session.calls)
@@ -210,3 +214,60 @@ def test_spare_keys_are_read_from_the_environment(monkeypatch):
     assert configured_keys() == ["a", "b"]
     monkeypatch.delenv("GEMINI_API_KEY")
     assert configured_keys() == ["b", "a"] and GeminiClient().key == "b"
+
+
+def _quota_response(quota_id, delay="20s"):
+    return Response(429, {"error": {"details": [
+        {"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [{"quotaId": quota_id}]},
+        {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": delay}]}})
+
+
+def test_per_minute_quota_is_waited_out_instead_of_giving_up():
+    minute = "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
+    responses = [_quota_response(minute) for _ in range(3 * 7)] + [ok({"ok": 1})]
+    c, session, sleeps = _keyed(*responses)
+    assert c.generate_json("s", "p", {"type": "object"}) == {"ok": 1}
+    assert len(sleeps) == 7 and all(wait == 21 for wait in sleeps)  # the API's own retry delay
+    assert not c.unavailable
+
+
+def test_daily_quota_moves_to_a_fallback_model_with_its_own_quota(monkeypatch):
+    monkeypatch.setenv("GEMINI_FALLBACK_MODELS", "gemini-retired,gemini-2.5-flash")
+    day = "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+    sleeps, session = [], Session(_quota_response(day), _quota_response(day),
+                                  Response(404), ok({"ok": 1}), ok({"ok": 2}))
+    c = GeminiClient(keys=["k1", "k2"], session=session, sleep=sleeps.append)
+    assert c.generate_json("s", "p", {"type": "object"}) == {"ok": 1}
+    urls = [call[0].rsplit("/", 1)[-1] for call in session.calls]
+    assert urls == ["gemini-3-flash-preview:generateContent"] * 2 + [
+        "gemini-retired:generateContent", "gemini-2.5-flash:generateContent"]
+    assert c.model == "gemini-2.5-flash" and c.keys == ["k1", "k2"] and sleeps == []
+    assert c.generate_json("s", "p", {"type": "object"}) == {"ok": 2}
+
+
+def test_daily_quota_with_no_fallback_hands_over_to_the_local_model(monkeypatch):
+    monkeypatch.setenv("GEMINI_FALLBACK_MODELS", "")
+    day = "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+    c, session, sleeps = _keyed(_quota_response(day), _quota_response(day), keys=("k1", "k2"))
+    with pytest.raises(GeminiUnavailable):
+        c.generate_json("s", "p", {"type": "object"})
+    assert c.unavailable and sleeps == [] and len(session.calls) == 2
+
+
+def test_search_grounding_without_quota_gives_up_at_once():
+    c, session, sleeps = _keyed(Response(429), Response(429), Response(429))
+    with pytest.raises(GeminiUnavailable):
+        c.generate_grounded("s", "p")
+    assert len(session.calls) == 3 and sleeps == [] and not c.unavailable
+
+
+def test_uploaded_file_requests_stay_on_their_key():
+    media = [{"fileData": {"fileUri": "https://files/abc", "mimeType": "video/mp4"}}]
+    minute = "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
+    c, session, sleeps = _keyed(_quota_response(minute), ok({"ok": 1}))
+    assert c.generate_json("s", "p", {"type": "object"}, media=media) == {"ok": 1}
+    assert [call[1]["headers"]["x-goog-api-key"] for call in session.calls] == ["k1", "k1"]
+    c, session, _ = _keyed(Response(403))
+    with pytest.raises(GeminiUnavailable):
+        c.generate_json("s", "p", {"type": "object"}, media=media)
+    assert c.keys == ["k1", "k2", "k3"] and not c.unavailable

@@ -21,6 +21,13 @@ DEFAULT_MODEL = "gemini-3-flash-preview"
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 6
 MAX_BACKOFF_SECONDS = 90
+# A per-minute quota refills within a minute or two: waiting is far better than handing the
+# writing to the slow, weaker local model. Up to this many waits per request (~12 minutes).
+MAX_QUOTA_WAITS = 8
+# Free-tier quotas are counted per model, so when the main model's daily quota is spent on
+# every key, these models (each with its own quota) carry on before the local model does.
+# A model this API no longer offers is skipped.
+FALLBACK_MODELS = "gemini-2.5-flash,gemini-flash-latest,gemini-flash-lite-latest"
 # Story recaps legitimately describe violence, death and self-harm. Block only
 # high-probability harm so ordinary drama plots are not refused.
 SAFETY = [{"category": category, "threshold": "BLOCK_ONLY_HIGH"} for category in (
@@ -65,6 +72,21 @@ def _retry_delay(response, attempt):
     return min(2 ** (attempt + 1), MAX_BACKOFF_SECONDS)
 
 
+def _quota(response):
+    """(scope, quota ids) named by a 429: scope is "day", "minute" or "" when not stated."""
+    ids = []
+    try:
+        for detail in response.json().get("error", {}).get("details", []):
+            for violation in (detail.get("violations") or []) if isinstance(detail, dict) else []:
+                if isinstance(violation, dict) and violation.get("quotaId"):
+                    ids.append(str(violation["quotaId"]))
+    except (AttributeError, ValueError):
+        pass
+    text = " ".join(ids)
+    scope = "day" if re.search(r"per\s*day", text, re.I) else "minute" if re.search(r"per\s*minute", text, re.I) else ""
+    return scope, ", ".join(dict.fromkeys(ids))
+
+
 def _text(payload):
     candidates = payload.get("candidates") if isinstance(payload, dict) else None
     if not candidates:
@@ -86,8 +108,12 @@ class GeminiClient:
     def __init__(self, key=None, model=None, *, session=None, sleep=time.sleep, keys=None):
         self.keys = list(keys) if keys is not None else ([key] if key is not None else configured_keys())
         self.keys = [k for k in self.keys if k]
+        self.all_keys = list(self.keys)
         self.index = 0
         self.model = (model or os.getenv("GEMINI_MODEL") or DEFAULT_MODEL).strip()
+        fallbacks = os.getenv("GEMINI_FALLBACK_MODELS", FALLBACK_MODELS if model is None else "")
+        self.fallbacks = [m.strip() for m in fallbacks.split(",") if m.strip() and m.strip() != self.model]
+        self._reported = set()
         self.session = session or requests.Session()
         self.sleep = sleep
         self.min_interval = float(os.getenv("GEMINI_MIN_INTERVAL", "0") or 0)
@@ -129,7 +155,10 @@ class GeminiClient:
         body = {"systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [*(media or []), {"text": prompt}]}],
                 "generationConfig": config, "safetySettings": SAFETY}
-        return self._request(body, lambda payload: json.loads(_text(payload)))
+        # An uploaded file belongs to the key (project) that uploaded it: such a request stays
+        # on that key and model rather than rotating to a spare that cannot read the file.
+        pinned = any(isinstance(part, dict) and "fileData" in part for part in media or [])
+        return self._request(body, lambda payload: json.loads(_text(payload)), pinned=pinned)
 
     def generate_grounded(self, system, prompt, *, max_tokens=32768):
         """Answer researched with Google Search: (text, [{"uri", "title"}] of the web sources used).
@@ -156,14 +185,27 @@ class GeminiClient:
             if not sources:
                 raise NotGrounded("Gemini's answer was not grounded in any web source.")
             return text, sources
-        return self._request(body, parse)
+        return self._request(body, parse, patient=False)
 
-    def _request(self, body, parse):
-        url = f"{API_ROOT}/{self.model}:generateContent"
+    def _switch_model(self):
+        """Every key has spent the current model's daily quota: move to the next fallback model."""
+        while self.fallbacks:
+            previous, self.model = self.model, self.fallbacks.pop(0)
+            self.keys, self.index = list(self.all_keys), 0
+            print(f"Gemini {previous} has used its daily quota on every key; continuing with {self.model}.",
+                  flush=True)
+            return True
+        return False
+
+    def _request(self, body, parse, *, patient=True, pinned=False):
+        """POST with key rotation. ``patient`` requests wait out per-minute quotas and move to a
+        fallback model when a daily quota is spent; impatient ones (optional extras) give up."""
         last_problem = "no attempt was made"
         tried = {self.index}
-        attempt = 0
+        attempt = waits = 0
+        on_fallback = False
         while attempt < MAX_ATTEMPTS:
+            url = f"{API_ROOT}/{self.model}:generateContent"
             wait = self.min_interval - (time.monotonic() - self._last)
             if wait > 0:
                 self.sleep(wait)
@@ -175,9 +217,12 @@ class GeminiClient:
             except requests.RequestException as exc:
                 last_problem = type(exc).__name__
             if response is not None:
+                if response.status_code in (401, 403) and pinned:
+                    raise GeminiUnavailable(f"Gemini could not read the uploaded file (HTTP {response.status_code}).")
                 if response.status_code in (401, 403):
                     # A revoked or wrong key is dropped; the spares carry on.
                     self.keys.pop(self.index)
+                    self.all_keys = [k for k in self.all_keys if k in self.keys]
                     self.index = 0
                     tried = {0}
                     if not self.keys:
@@ -186,6 +231,13 @@ class GeminiClient:
                     print(f"A Gemini key was rejected (HTTP {response.status_code}); using a spare key.", flush=True)
                     continue
                 if response.status_code in (400, 404):
+                    if on_fallback and patient:
+                        # This fallback model is not offered (any more): try the next one.
+                        print(f"Gemini model {self.model} is not available (HTTP {response.status_code}).", flush=True)
+                        if self._switch_model():
+                            tried = {self.index}
+                            continue
+                        break
                     raise PipelineError(
                         f"Gemini rejected the request (HTTP {response.status_code}). Check GEMINI_API_KEY "
                         f"and that model {self.model} is available to this key.")
@@ -199,15 +251,50 @@ class GeminiClient:
                         last_problem = f"unusable response ({type(exc).__name__})"
                 else:
                     last_problem = f"HTTP {response.status_code}"
-                    if response.status_code == 429 and self._next_key(tried):
-                        tried.add(self.index)
-                        continue  # a spare key with its own quota: no waiting
+                    if response.status_code == 429:
+                        scope, ids = _quota(response)
+                        if ids and (self.model, ids) not in self._reported:
+                            self._reported.add((self.model, ids))
+                            print(f"Gemini quota reached on {self.model}: {ids}.", flush=True)
+                        if scope == "day" and pinned:
+                            # The next upload goes to a key that still has quota today.
+                            if len(self.keys) > 1:
+                                self.keys.pop(self.index)
+                                self.index = 0
+                            raise GeminiUnavailable(f"Gemini's daily quota is spent ({ids}).")
+                        if scope == "day" and patient:
+                            # Spent until tomorrow: never ask this key for this model again in this run.
+                            self.keys.pop(self.index)
+                            self.index = 0
+                            tried = {0}
+                            if self.keys:
+                                continue
+                            if self._switch_model():
+                                on_fallback = True
+                                tried = {self.index}
+                                continue
+                            self.keys = list(self.all_keys)
+                            break
+                        if not pinned and self._next_key(tried):
+                            tried.add(self.index)
+                            continue  # a spare key with its own quota: no waiting
+                        if not patient:
+                            break
+                        if scope == "minute" or waits < MAX_QUOTA_WAITS // 2:
+                            # Every key is limited this minute: wait for the refill without
+                            # spending one of the request's attempts.
+                            waits += 1
+                            if waits <= MAX_QUOTA_WAITS:
+                                tried = {self.index}
+                                self.sleep(_retry_delay(response, min(waits, 6)))
+                                continue
             attempt += 1
             tried = {self.index}
             if attempt < MAX_ATTEMPTS:
                 self.sleep(_retry_delay(response, attempt - 1))
-        self.unavailable = True
-        raise GeminiUnavailable(f"Gemini was unavailable after {MAX_ATTEMPTS} attempts: {last_problem}.")
+        if patient and not pinned:
+            self.unavailable = True
+        raise GeminiUnavailable(f"Gemini was unavailable after {attempt + waits} attempts: {last_problem}.")
 
     def upload_file(self, path, mime_type, *, display_name="recap-source", wait_seconds=300):
         """Upload a local file with the resumable File API and wait until it can be used.

@@ -133,6 +133,11 @@ class Fandom:
         self.show = show
         self.base = None
         self.wiki = ""
+        self.misses = {}   # why episodes found no plot, for the run log
+
+    def _miss(self, reason, example=""):
+        count, first = self.misses.get(reason, (0, example))
+        self.misses[reason] = (count + 1, first or example)
 
     def _get(self, base, **params):
         response = self.session.get(base + "/api.php", params={**params, "format": "json", "formatversion": 2},
@@ -162,11 +167,14 @@ class Fandom:
         try:
             found = self._get(self.base, action="query", list="search", srsearch=title, srlimit=8,
                               srnamespace=0).get("query", {}).get("search", [])
-        except Exception:
+        except Exception as exc:
+            self._miss(f"search failed ({type(exc).__name__})", title)
             return None
         wanted = _slug(title)
         pages = [row.get("title", "") for row in found
                  if _slug(re.sub(r"\s*\(.*?\)\s*$", "", row.get("title", ""))) == wanted]
+        if not pages:
+            self._miss("no page with the episode's title", f"{title} -> {[r.get('title') for r in found[:4]]}")
         for page in pages[:2]:
             try:
                 parsed = self._get(self.base, action="parse", page=page, prop="text", redirects=1,
@@ -186,6 +194,7 @@ class Fandom:
             coded = re.search(rf"\bs0*{int(season)}\s*e0*{number}\b|\b0*{int(season)}x0*{number}\b", header, re.I)
             if not coded and not (re.search(rf"season{label}{int(season)}\b", header, re.I)
                                   and re.search(rf"episode{label}{number}\b", header, re.I)):
+                self._miss("infobox did not confirm season and episode", f"{page}: {header[:160]}")
                 continue
             parts = re.split(r"(<h2\b.*?</h2>)", html, flags=re.S | re.I)
             text = ""
@@ -196,6 +205,8 @@ class Fandom:
             text = re.sub(r"\[\s*edit\s*\]", "", text).strip()
             if text:
                 return text, f"{self.base}/wiki/" + page.replace(" ", "_")
+            headings = [_plain_html(parts[i]) for i in range(1, len(parts) - 1, 2)]
+            self._miss("no plot section", f"{page}: {headings[:8]}")
         return None
 
 
@@ -245,6 +256,13 @@ def _fandom_plots(bundle, cache_dir, session=None):
                         result = fandom.plot(season["number"], episode)
                         if result:
                             cached["plots"][str(episode["id"])] = list(result)
+                total = sum(len(s.get("episodes", [])) for s in bundle.get("seasons", []))
+                print(f"Wiki research: {fandom.wiki} had plots for {len(cached['plots'])} of {total} episodes.",
+                      flush=True)
+                for reason, (count, example) in fandom.misses.items():
+                    print(f"  {count} x {reason}; e.g. {str(example)[:220]}", flush=True)
+            else:
+                print(f"Wiki research: no Fandom wiki found for {show.get('title')}.", flush=True)
         try:
             save_json(path, cached)
         except OSError:
