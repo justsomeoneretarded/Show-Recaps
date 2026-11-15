@@ -71,10 +71,28 @@ def custom_pronunciations() -> dict[str, str]:
     return {rf"\b{re.escape(str(word))}\b": str(spoken) for word, spoken in data.items() if str(word).strip()}
 
 
+_ONES = ("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
+         "fifteen sixteen seventeen eighteen nineteen").split()
+_TENS = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety")
+
+
+def _small_number(match) -> str:
+    value = int(match[0])
+    if value < 20:
+        return _ONES[value]
+    return _TENS[value // 10] + ("" if value % 10 == 0 else "-" + _ONES[value % 10])
+
+
 def spoken_form(text: str) -> str:
-    """The text as the narrator should say it (respellings for known trouble titles and abbreviations)."""
+    """The text as the narrator should say it (respellings for known trouble titles and abbreviations).
+
+    Small standalone numbers ("seasons 1 through 3") are spelled out: the voice model reads digits
+    unreliably and has produced garbled takes on them. Years, times, money, decimals and
+    percentages keep their digits.
+    """
     for pattern, replacement in {**PRONUNCIATIONS, **custom_pronunciations()}.items():
         text = re.sub(pattern, replacement, text)
+    text = re.sub(r"(?<![\w.,:$£€#/-])\d{1,2}(?![\w%/]|[.,:]\d)", _small_number, text)
     return " ".join(text.split())
 
 

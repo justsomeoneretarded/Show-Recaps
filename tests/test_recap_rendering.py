@@ -390,3 +390,25 @@ def test_chosen_voice_speed_quickens_every_narration_paragraph(tmp_path, monkeyp
     # No paragraph is ever shown over a blank title plate.
     assert all(shot.get("scope") != "neutral-title-card"
                for _, events in results.values() for e in events for shot in e["shots"])
+
+
+@media
+def test_unvoiceable_intro_line_is_left_out_not_the_whole_recap(tmp_path, monkeypatch, assets):
+    from movie_pipeline.speech_recovery import SpeechRecoveryError
+    monkeypatch.setattr(render, "music_bed", _quiet_music)
+    monkeypatch.setenv("VIDEO_RESOLUTION", "720")
+    script = _script("season")
+    intro = next(section for section in script["sections"] if section["kind"] == "intro")["paragraphs"][0]
+
+    class FailingIntro(SyntheticRecovery):
+        def recover(self, text, initial=None, *, label="speech", **unused):
+            if text == intro:
+                raise SpeechRecoveryError("garbled takes")
+            return super().recover(text, initial, label=label)
+
+    report = rendering.render_recap(script, _spec(), _bundle(), assets, tmp_path / "package", tmp_path / "work",
+                                    recovery=FailingIntro(tmp_path / "voice"))
+    assert report["status"] == "passed"
+    assert any("intro line was left out" in warning for warning in report["warnings"])
+    events = json.loads((tmp_path / "package" / "timeline.json").read_text())["events"]
+    assert not any(event.get("section_id") == "intro" for event in events)

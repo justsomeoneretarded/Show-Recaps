@@ -82,6 +82,16 @@ def _speech_chunks(text: str) -> list[str]:
     return chunks
 
 
+def _sentence_parts(text: str) -> list[str]:
+    """Every sentence of ``text`` on its own, keeping initials and abbreviations intact."""
+    protected = re.sub(r"\b(?:Mr|Mrs|Ms|Dr|Prof|St|vs|etc)\.",
+                       lambda match: match[0].replace(".", "\u2024"), text)
+    protected = re.sub(r"\b[A-Z]\.(?=\s+[A-Z])",
+                       lambda match: match[0].replace(".", "\u2024"), protected)
+    return [part.replace("\u2024", ".").strip()
+            for part in re.split(r"(?<=[.!?])\s+(?=[\"'“‘A-Z0-9])", protected.strip()) if part.strip()]
+
+
 class SpeechRecovery:
     """Shared recovery for hooks, reviews, availability lines, outros and CTAs.
 
@@ -182,7 +192,7 @@ class SpeechRecovery:
 
     def recover(self, text: str, initial: Path | None = None, *, label: str = "speech",
                 max_seconds: float | None = None, allow_split: bool = True,
-                attempts: int = 3) -> tuple[Path, list[dict]]:
+                attempts: int = 3, sentence_fallback: bool = False) -> tuple[Path, list[dict]]:
         attempts = max(1, min(3, attempts))
         for attempt in range(attempts):
             try:
@@ -204,6 +214,11 @@ class SpeechRecovery:
             if attempt+1 < attempts:
                 print(f"Regenerating {label} with the selected voice (take {attempt+2}/{attempts}).", flush=True)
         chunks = _speech_chunks(text) if allow_split else []
+        if allow_split and sentence_fallback and len(chunks) <= 1:
+            # A short paragraph is normally voiced whole. When every whole take failed, its
+            # sentences get their own takes as a last resort (still every word, in order).
+            sentences = [part for part in _sentence_parts(text) if part]
+            chunks = sentences if len(sentences) > 1 else chunks
         # Normal script paragraphs produce two or three thoughts. Even unusually
         # large external inputs receive a bounded repair without losing words.
         if len(chunks) > 6:

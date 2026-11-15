@@ -19,7 +19,7 @@ from movie_pipeline import audio_review, render, voice
 from movie_pipeline.core import PipelineError, duration, ffmpeg, probe, save_json, voice_reference, write_srt
 from movie_pipeline.sound_design import delivery_speed
 from movie_pipeline.soundtrack import music_credit, narration_rate, theme_for
-from movie_pipeline.speech_recovery import SpeechRecovery
+from movie_pipeline.speech_recovery import SpeechRecovery, SpeechRecoveryError
 from movie_pipeline.subtitles import script_cues
 from movie_pipeline.timing import DurationSpec
 
@@ -387,7 +387,19 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
                     if speaker is not None:
                         speaker.delivery = delivery
                     label_text = f"{section['id']} paragraph {paragraph_index + 1}"
-                    audio, aligned = recovery.recover(text, label=label_text)
+                    try:
+                        audio, aligned = recovery.recover(text, label=label_text, sentence_fallback=True)
+                    except SpeechRecoveryError:
+                        if section["kind"] not in ("intro", "outro"):
+                            raise
+                        # The fixed opening/closing line is not story: an unvoiceable one is left
+                        # out rather than throwing away the whole recap.
+                        print(f"Leaving out the {section['kind']} line: no take could be verified.", flush=True)
+                        report.setdefault("warnings", []).append(
+                            f"The {section['kind']} line was left out because no voice take could be verified.")
+                        if chapters and chapters[-1]["section_id"] == section["id"] and chapters[-1]["start"] == clock:
+                            chapters.pop()
+                        continue
                     raw_seconds = duration(audio)
                     pace = delivery_speed(narration_rate(theme), delivery,
                                           words=len(text.split()), seconds=raw_seconds)

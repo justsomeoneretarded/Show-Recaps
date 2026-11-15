@@ -217,3 +217,11 @@ def test_unknown_model_is_rejected_before_generation(monkeypatch):
     monkeypatch.setenv("TTS_MODEL", "unsupported")
     with pytest.raises(PipelineError, match="original, turbo or nano"):
         selected_tts_model()
+
+
+def test_small_numbers_are_spelled_out_for_the_voice():
+    from movie_pipeline.voice import spoken_form
+    assert spoken_form("seasons 1 through 3, before season 4 and episode 21.") == \
+        "seasons one through three, before season four and episode twenty-one."
+    assert spoken_form("At 10:45 it cost $5, 2.5 kg, 10% off, in 2022, 24/7, 3rd.") == \
+        "At 10:45 it cost $5, 2.5 kg, 10% off, in 2022, 24/7, 3rd."

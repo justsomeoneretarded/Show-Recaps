@@ -401,3 +401,27 @@ def test_reconstruction_failure_has_recovery_error_and_cleans_listing(tmp_path, 
 
     assert not list(service.work.glob("*.concat.txt"))
     assert service.events[-1]["stage"] == "thought-assembly"
+
+
+def test_short_paragraph_falls_back_to_separate_sentences(tmp_path, monkeypatch):
+    first = "Spoilers ahead."
+    second = "Here is the whole story so far, so you are ready."
+    text = first + " " + second
+    assert len(recovery._speech_chunks(text)) == 1  # normally voiced whole
+    shared = tmp_path / "take.wav"
+    recognized, emitted = {}, []
+
+    def speak(words, **options):
+        emitted.append(words)
+        write_wave(shared, .4, 1500)
+        recognized[shared] = words
+        return shared
+
+    narrator = SimpleNamespace(speak=Mock(side_effect=speak), close=Mock())
+    service, _ = make_recovery(tmp_path, object(), speaker=narrator)
+    monkeypatch.setattr(recovery, "duration", duration)
+    monkeypatch.setattr(recovery.voice, "captions", lambda path, model, **kwargs: [
+        {"start": .02, "end": .38, "text": recognized[path] if recognized[path] != text else "I'm sorry"}])
+    result, cues = service.recover(text, attempts=1, sentence_fallback=True)
+    assert emitted == [text, first, second]
+    assert " ".join(cue["text"] for cue in cues) == text
