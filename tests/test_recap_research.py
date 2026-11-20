@@ -599,3 +599,11 @@ def test_current_fully_aired_prior_season_works_and_unaired_specials_do_not_bloc
     result = research.research_show(spec(), tmp_path, session=client, today=TODAY)
     assert [episode["id"] for episode in result["seasons"][-1]["episodes"]] == ["201", "202"]
     assert "FORBIDDEN" not in json.dumps(result)
+
+
+def test_brand_possessive_titles_match_the_plain_title():
+    from recap_pipeline.research import _matches
+    show = {"name": "Marvel's The Punisher", "premiered": "2017-11-17"}
+    assert _matches(show, "The Punisher", 2017) and _matches(show, "Marvel's The Punisher", 2017)
+    assert not _matches(show, "The Punisher", 2004)
+    assert not _matches({"name": "Grey's Anatomy", "premiered": "2005-03-27"}, "Anatomy", 2005)

@@ -192,7 +192,22 @@ def _matches(show, title, year, *, tmdb=False):
         return False
     names = [show.get("name"), show.get("original_name")] if tmdb else [show.get("name")]
     premiered = show.get("first_air_date") if tmdb else show.get("premiered")
-    return any(name and _norm(name) == _norm(title) for name in names) and _year(premiered) == year
+    wanted = {_norm(title), _unbranded(title)}
+    return (any(name and {_norm(name), _unbranded(name)} & wanted for name in names)
+            and _year(premiered) == year)
+
+
+_BRANDS = ("marvel s", "marvels", "dc s", "dcs", "tom clancy s", "stephen king s", "agatha christie s",
+           "george r r martin s", "nora roberts s", "neil gaiman s", "jk rowling s")
+
+
+def _unbranded(value):
+    """The title without a leading brand possessive: "Marvel's The Punisher" -> "the punisher"."""
+    text = _norm(value)
+    for brand in _BRANDS:
+        if text.startswith(brand + " "):
+            return text[len(brand) + 1:]
+    return text
 
 
 def _resolve_show(http, title, year, ids):
