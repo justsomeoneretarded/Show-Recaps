@@ -936,7 +936,11 @@ def research_show(spec, cache_dir: Path, *, session=None, today: date | None = N
         external = show.get("externals") or {}
         prior_images = [item["image"] for season in seasons for item in season["episodes"] if item["image"]]
         bundle = {"schema_version": _SCHEMA,
-                  "show": {"id": show["id"], "title": show["name"], "year": year,
+                  # The title as requested ("The Punisher") when the listing adds a brand
+                  # possessive ("Marvel's The Punisher"): every later identity check and the
+                  # video titles use the viewer's familiar name.
+                  "show": {"id": show["id"], "title": show["name"] if _norm(show["name"]) == _norm(title) else title,
+                           "official_title": show["name"], "year": year,
                            "ambiguous_title": show["_recap_ambiguous_title"],
                            "genres": [value for value in (show.get("genres") or []) if isinstance(value, str)],
                            "summary": "", "url": sources[0]["url"],

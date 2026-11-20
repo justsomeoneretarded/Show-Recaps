@@ -607,3 +607,12 @@ def test_brand_possessive_titles_match_the_plain_title():
     assert _matches(show, "The Punisher", 2017) and _matches(show, "Marvel's The Punisher", 2017)
     assert not _matches(show, "The Punisher", 2004)
     assert not _matches({"name": "Grey's Anatomy", "premiered": "2005-03-27"}, "Anatomy", 2005)
+
+
+def test_branded_listing_keeps_the_requested_title_for_later_checks(tmp_path):
+    client = session_for(candidates=[show(name="Marvel's The Bridge")])
+    result = research.research_show(spec(), tmp_path, session=client, today=TODAY)
+    assert result["show"]["title"] == "The Bridge"
+    assert result["show"]["official_title"] == "Marvel's The Bridge"
+    again = research.research_show(spec(), tmp_path, session=client, today=TODAY)  # the cache is valid
+    assert again["show"]["title"] == "The Bridge"
