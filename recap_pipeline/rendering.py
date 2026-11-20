@@ -51,6 +51,22 @@ def _environment(values):
                 os.environ[name] = value
 
 
+# On the CPU runner each voice take costs about 2.4 s per word (two takes: ~8 minutes per
+# 100-word paragraph), and a job may run six hours in all. Long scripts are voiced in one
+# take per phrase; every take is still transcribed and checked, and a failed one is redone.
+LONG_SCRIPT_WORDS = 1800
+
+
+def voice_takes(script) -> int:
+    """Takes per phrase: two for shorter scripts (the better one is kept), one for long ones."""
+    configured = os.getenv("VOICE_TAKES", "").strip()
+    if configured.isdigit():
+        return max(1, min(3, int(configured)))
+    words = sum(len(str(paragraph).split()) for section in script.get("sections", [])
+                for paragraph in section.get("paragraphs") or [])
+    return 1 if words > LONG_SCRIPT_WORDS else 2
+
+
 def _value(spec, name, default=None):
     return spec.get(name, default) if isinstance(spec, dict) else getattr(spec, name, default)
 
@@ -348,7 +364,10 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
         model = str(_value(spec, "tts_model", "original")).casefold()
         if model not in {"original", "turbo", "nano"}:
             raise PipelineError("TTS_MODEL must be original, turbo or nano.")
-        with _environment({"TTS_MODEL": model, "VIDEO_RESOLUTION": f"{width}x{height}", "VIDEO_GENRE": theme}):
+        takes = voice_takes(script)
+        report["voice_takes"] = takes
+        with _environment({"TTS_MODEL": model, "VIDEO_RESOLUTION": f"{width}x{height}", "VIDEO_GENRE": theme,
+                           "VOICE_TAKES": takes}):
             if recovery is None:
                 recovery, speaker, fingerprint = _make_recovery(spec, work)
                 report["speech"]["reference_sha256"] = fingerprint
