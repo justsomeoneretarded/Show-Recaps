@@ -183,6 +183,9 @@ def take_score(samples, rate: int, words: int) -> float:
     return -pace_cost - clipping_cost - max(0, longest / 50 - 0.9) * 3 + min(liveliness, 5) / 10
 
 
+PHRASE_RETRIES = 3   # extra takes for a phrase the check hears incomplete
+
+
 class Narrator:
     def __init__(self, reference: Path, cache: Path):
         import torch
@@ -208,6 +211,8 @@ class Narrator:
         self.emotion_enabled = (self.model_name == "original"
             and os.getenv("VOICE_EMOTION", "true").strip().lower() == "true")
         self.takes = max(1, min(3, int(os.getenv("VOICE_TAKES", "2"))))
+        # Optional callable(samples, rate, text) -> True (heard complete), False, or None (unknown).
+        self.phrase_check = None
         self.deliveries: dict[str, str] = {}
 
     def _generate(self, text: str, delivery: str, seed: int):
@@ -259,12 +264,29 @@ class Narrator:
                 for index, sentence in enumerate(phrases(sentences(spoken_form(text)), reveal, maximum=maximum)):
                     best, best_score = None, float("-inf")
                     # Keep complete takes and the same selected model through bounded retries.
-                    for take in range(self.takes):
+                    # With a phrase check, the first take that is heard complete is kept at once,
+                    # and a garbled or clipped phrase is redone on its own (a few seconds) instead
+                    # of failing the whole paragraph later (minutes per retake).
+                    phrase_check = getattr(self, "phrase_check", None)
+                    tries = self.takes + (PHRASE_RETRIES if phrase_check else 0)
+                    for take in range(tries):
+                        if not phrase_check and take >= self.takes:
+                            break
                         samples, rate = self._generate(sentence, delivery, seed_base + index * 131 + take * 17)
                         if not np.isfinite(samples).all() or not samples.size or np.max(np.abs(samples)) < 1e-5:
                             continue
                         samples = self._trim(samples.astype(np.float32), rate)
                         score = take_score(samples, rate, len(sentence.split()))
+                        if phrase_check is not None:
+                            try:
+                                heard = phrase_check(samples, rate, sentence)
+                            except Exception:  # noqa: BLE001 -- the paragraph check still runs
+                                heard = None
+                            if heard:
+                                best, best_score = samples, float("inf")
+                                break
+                            if heard is False:
+                                score -= 1000  # a take heard incomplete is a last resort
                         if score > best_score:
                             best, best_score = samples, score
                     if best is None:

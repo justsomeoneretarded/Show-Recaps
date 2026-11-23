@@ -225,3 +225,20 @@ def test_small_numbers_are_spelled_out_for_the_voice():
         "seasons one through three, before season four and episode twenty-one."
     assert spoken_form("At 10:45 it cost $5, 2.5 kg, 10% off, in 2022, 24/7, 3rd.") == \
         "At 10:45 it cost $5, 2.5 kg, 10% off, in 2022, 24/7, 3rd."
+
+
+def test_phrase_check_keeps_the_first_complete_take_and_redoes_garbled_ones(monkeypatch, tmp_path):
+    clean, garbled = speech_like(), speech_like() * 0.9
+    speaker = setup_speaker(monkeypatch, tmp_path, 3, clean)
+    speaker.takes = 2
+    speaker.model.generate = Mock(side_effect=[Wave(garbled), Wave(garbled), Wave(clean), Wave(clean)])
+    heard = iter([False, False, True])
+    speaker.phrase_check = lambda samples, rate, text: next(heard)
+    speaker.speak("A short line with six words.")
+    assert speaker.model.generate.call_count == 3   # two garbled takes redone, then the first good one kept
+    speaker2 = setup_speaker(monkeypatch, tmp_path / "b", 3, clean)
+    (tmp_path / "b").mkdir()
+    speaker2.takes = 2
+    speaker2.phrase_check = lambda samples, rate, text: True
+    speaker2.speak("Another short line of words here.")
+    assert speaker2.model.generate.call_count == 1   # a complete first take needs no second take

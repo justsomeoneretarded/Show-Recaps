@@ -51,20 +51,20 @@ def _environment(values):
                 os.environ[name] = value
 
 
-# On the CPU runner each voice take costs about 2.4 s per word (two takes: ~8 minutes per
-# 100-word paragraph), and a job may run six hours in all. Long scripts are voiced in one
-# take per phrase; every take is still transcribed and checked, and a failed one is redone.
-LONG_SCRIPT_WORDS = 1800
+# On the CPU runner each voice take costs about 2.4 s per word and a job may run six hours.
+# Every phrase is transcribed as soon as it is voiced and the first complete take is kept,
+# so a second take is only made for a phrase that came out garbled or clipped.
+
+
+MAX_SKIPPED_PARAGRAPHS = 2
 
 
 def voice_takes(script) -> int:
-    """Takes per phrase: two for shorter scripts (the better one is kept), one for long ones."""
+    """Takes per phrase (VOICE_TAKES overrides)."""
     configured = os.getenv("VOICE_TAKES", "").strip()
     if configured.isdigit():
         return max(1, min(3, int(configured)))
-    words = sum(len(str(paragraph).split()) for section in script.get("sections", [])
-                for paragraph in section.get("paragraphs") or [])
-    return 1 if words > LONG_SCRIPT_WORDS else 2
+    return 2   # each phrase is checked as it is voiced, so the second take is only made when needed
 
 
 def _value(spec, name, default=None):
@@ -183,14 +183,16 @@ def _end_screen(path, show_title, *, transparent=False):
 
 class _DeliverySpeaker:
     """One selected model and cloned reference across all delivery labels."""
-    def __init__(self, reference, cache):
+    def __init__(self, reference, cache, phrase_check=None):
         self.reference, self.cache = reference, cache
         self.delivery = "normal"
         self.model = None
+        self.phrase_check = phrase_check
 
     def speak(self, text, attempt_offset=0, *, force=False):
         if self.model is None:
             self.model = voice.Narrator(self.reference, self.cache)
+            self.model.phrase_check = self.phrase_check
         return self.model.speak(text, attempt_offset=attempt_offset,
                                 force=force, delivery=self.delivery)
 
@@ -234,6 +236,21 @@ def _sentence_shots(gemini, section, text, aligned, seconds, pool, usage, episod
     return chosen, cuts
 
 
+def _phrase_checker(recognizer, folder):
+    """A quick transcript check of one voiced phrase: True when it is heard complete."""
+    def check(samples, rate, text):
+        import soundfile as sf
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / "phrase.wav"
+        sf.write(path, samples, rate)
+        for vad in (True, False):   # silence trimming can drop a quiet first or last word
+            cues = voice.captions(path, recognizer, vad_filter=vad, beam_size=3)
+            if voice.speech_check(text, cues)["accepted"]:
+                return True
+        return False
+    return check
+
+
 def _make_recovery(spec, work):
     # Imported lazily so planner and synthetic FFmpeg tests download no models.
     from faster_whisper import WhisperModel
@@ -244,10 +261,10 @@ def _make_recovery(spec, work):
     if choice not in names:
         raise PipelineError("Choose Warguy, KitLaser, or Female for recap narration.")
     reference = voice_reference(names[choice], Path(os.getenv("VOICE_DIR", "assets/voices")))
-    speaker = _DeliverySpeaker(reference, work / "speech")
     recognizer = WhisperModel("base.en", device="cpu", compute_type="int8",
                               cpu_threads=min(os.cpu_count() or 2, 4),
                               download_root=os.getenv("SPEECH_VERIFY_MODEL_DIR") or None)
+    speaker = _DeliverySpeaker(reference, work / "speech", _phrase_checker(recognizer, work / "phrase-checks"))
     recovery = SpeechRecovery(recognizer, lambda: speaker, work / "speech-checks",
         fallback_factory=lambda: WhisperModel("small.en", device="cpu", compute_type="int8",
             cpu_threads=min(os.cpu_count() or 2, 4),
@@ -386,6 +403,7 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
             if analyses:
                 scoped_assets = {**scoped_assets, "_analyses": analyses}
             parts, timeline, cues, chapters, clock = [], [], [], [], 0.0
+            skipped_story = 0
             for section_index, section in enumerate(script["sections"]):
                 paragraphs = section.get("paragraphs") or []
                 if not paragraphs:
@@ -409,13 +427,19 @@ def render_recap(script, spec, bundle, assets, output: Path, work: Path, *, reco
                     try:
                         audio, aligned = recovery.recover(text, label=label_text, sentence_fallback=True)
                     except SpeechRecoveryError:
-                        if section["kind"] not in ("intro", "outro"):
+                        fixed = section["kind"] in ("intro", "outro")
+                        # The fixed opening/closing line is not story, and one story paragraph of a
+                        # long recap (at most MAX_SKIPPED_PARAGRAPHS, never a section's only one)
+                        # is left out rather than throwing away hours of finished recap.
+                        if not fixed and (skipped_story >= MAX_SKIPPED_PARAGRAPHS or len(paragraphs) < 2
+                                          or section["kind"] == "ending" and paragraph_index == len(paragraphs) - 1):
                             raise
-                        # The fixed opening/closing line is not story: an unvoiceable one is left
-                        # out rather than throwing away the whole recap.
-                        print(f"Leaving out the {section['kind']} line: no take could be verified.", flush=True)
+                        if not fixed:
+                            skipped_story += 1
+                        what = f"the {section['kind']} line" if fixed else f"{label_text}"
+                        print(f"Leaving out {what}: no voice take could be verified.", flush=True)
                         report.setdefault("warnings", []).append(
-                            f"The {section['kind']} line was left out because no voice take could be verified.")
+                            f"Narration left out because no voice take could be verified: {what}.")
                         if chapters and chapters[-1]["section_id"] == section["id"] and chapters[-1]["start"] == clock:
                             chapters.pop()
                         continue

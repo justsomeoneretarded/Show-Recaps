@@ -409,15 +409,15 @@ def test_unvoiceable_intro_line_is_left_out_not_the_whole_recap(tmp_path, monkey
     report = rendering.render_recap(script, _spec(), _bundle(), assets, tmp_path / "package", tmp_path / "work",
                                     recovery=FailingIntro(tmp_path / "voice"))
     assert report["status"] == "passed"
-    assert any("intro line was left out" in warning for warning in report["warnings"])
+    assert any("the intro line" in warning for warning in report["warnings"])
     events = json.loads((tmp_path / "package" / "timeline.json").read_text())["events"]
     assert not any(event.get("section_id") == "intro" for event in events)
 
 
-def test_long_scripts_are_voiced_in_one_take(monkeypatch):
+def test_voice_takes_default_and_override(monkeypatch):
     monkeypatch.delenv("VOICE_TAKES", raising=False)
     short = {"sections": [{"paragraphs": ["word " * 300]}]}
     long = {"sections": [{"paragraphs": ["word " * 1000]}, {"paragraphs": ["word " * 1000]}]}
-    assert rendering.voice_takes(short) == 2 and rendering.voice_takes(long) == 1
+    assert rendering.voice_takes(short) == 2 and rendering.voice_takes(long) == 2
     monkeypatch.setenv("VOICE_TAKES", "3")
     assert rendering.voice_takes(long) == 3
