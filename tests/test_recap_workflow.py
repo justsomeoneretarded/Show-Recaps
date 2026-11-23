@@ -25,7 +25,7 @@ def test_recap_workflow_two_outputs_share_one_frozen_prepare():
     render=data["jobs"]["render"]["steps"]
     upload=next(s for s in render if s.get("name")=="Upload completed package")
     assert "if" not in upload
-    assert upload["with"]["retention-days"]=="2"
+    assert upload["with"]["retention-days"]=="14"
     assert upload["with"]["path"]=="output/${{ matrix.kind }}/"
     shared=next(s for s in data["jobs"]["prepare"]["steps"] if s.get("uses","").startswith("actions/upload-artifact") and "if" not in s)
     assert shared["with"]["retention-days"]=="1"
