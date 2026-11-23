@@ -265,7 +265,7 @@ jobs:
         with:
           name: show-recap-${{ matrix.kind }}
           path: output/${{ matrix.kind }}/
-          retention-days: 2
+          retention-days: 14
       - name: Speech diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
