@@ -271,3 +271,30 @@ def test_uploaded_file_requests_stay_on_their_key():
     with pytest.raises(GeminiUnavailable):
         c.generate_json("s", "p", {"type": "object"}, media=media)
     assert c.keys == ["k1", "k2", "k3"] and not c.unavailable
+
+
+def test_daily_quota_spent_everywhere_switches_gemini_off_for_every_later_client(monkeypatch):
+    monkeypatch.setenv("GEMINI_FALLBACK_MODELS", "")
+    day = "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+    c, _, _ = _keyed(_quota_response(day), keys=("k1",))
+    with pytest.raises(GeminiUnavailable):
+        c.generate_json("s", "p", {"type": "object"})
+    later, session, _ = _keyed(ok({"ok": 1}), keys=("k2",))
+    with pytest.raises(GeminiUnavailable, match="off for this run"):
+        later.generate_json("s", "p", {"type": "object"})
+    assert session.calls == []
+
+
+def test_time_lost_to_waits_is_capped_for_the_whole_run(monkeypatch, capsys):
+    monkeypatch.setenv("GEMINI_WAIT_BUDGET_MINUTES", "1")
+    minute = "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
+    c, session, sleeps = _keyed(*[_quota_response(minute) for _ in range(30)], keys=("k1",))
+    with pytest.raises(GeminiUnavailable, match="off for this run"):
+        c.generate_json("s", "p", {"type": "object"})
+    assert sum(sleeps) <= 60 and len(session.calls) < 30
+    out = capsys.readouterr().out
+    assert "waiting 21 s" in out and "switched off for the rest of this run" in out
+    later, session, _ = _keyed(ok({"ok": 1}), keys=("k2",))
+    with pytest.raises(GeminiUnavailable):
+        later.generate_json("s", "p", {"type": "object"})
+    assert session.calls == []

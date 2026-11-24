@@ -17,6 +17,8 @@ def _no_live_gemini(monkeypatch):
     """Tests never reach the real Gemini API, even when a developer has a key set."""
     for name in ("GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GOOGLE_API_KEY", "GEMINI_MODEL", "GEMINI_MIN_INTERVAL", "RECAP_WRITER"):
         monkeypatch.delenv(name, raising=False)
+    from recap_pipeline import gemini
+    gemini.reset_run_state()
 
 
 @_pytest.fixture(autouse=True)

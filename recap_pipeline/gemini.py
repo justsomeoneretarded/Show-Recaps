@@ -24,6 +24,8 @@ MAX_BACKOFF_SECONDS = 90
 # A per-minute quota refills within a minute or two: waiting is far better than handing the
 # writing to the slow, weaker local model. Up to this many waits per request (~12 minutes).
 MAX_QUOTA_WAITS = 8
+# Long generations finish well within this; a hung connection must not cost ten minutes.
+REQUEST_TIMEOUT = 300
 # Free-tier quotas are counted per model, so when the main model's daily quota is spent on
 # every key, these models (each with its own quota) carry on before the local model does.
 # A model this API no longer offers is skipped.
@@ -33,6 +35,30 @@ FALLBACK_MODELS = "gemini-2.5-flash,gemini-flash-latest,gemini-flash-lite-latest
 SAFETY = [{"category": category, "threshold": "BLOCK_ONLY_HIGH"} for category in (
     "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
     "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")]
+
+
+# Time a run may lose to Gemini (quota waits, backoff, failed or hung requests), shared by every
+# client in the process. Past it Gemini is off for the rest of the run, so a spent free tier can
+# never stall preparation for hours: the local model and cached results carry on.
+DEFAULT_WAIT_BUDGET_MINUTES = 40
+_RUN = {"lost": 0.0, "off": ""}
+
+
+def reset_run_state():
+    _RUN.update(lost=0.0, off="")
+
+
+def _wait_budget():
+    try:
+        return max(0.0, float(os.getenv("GEMINI_WAIT_BUDGET_MINUTES", DEFAULT_WAIT_BUDGET_MINUTES))) * 60
+    except ValueError:
+        return DEFAULT_WAIT_BUDGET_MINUTES * 60
+
+
+def _switch_off(reason):
+    if not _RUN["off"]:
+        _RUN["off"] = reason
+        print(f"Gemini switched off for the rest of this run: {reason}.", flush=True)
 
 
 class GeminiUnavailable(PipelineError):
@@ -142,8 +168,7 @@ class GeminiClient:
         ``{"fileData": {...}}`` or ``{"inlineData": {...}}`` placed before the prompt."""
         if not self.key:
             raise PipelineError("GEMINI_API_KEY is not configured.")
-        if self.unavailable:
-            raise GeminiUnavailable("Gemini was unavailable earlier in this run.")
+        self._check_run()
         config = {"responseMimeType": "application/json", "responseJsonSchema": schema,
                   "maxOutputTokens": max_tokens}
         if media_resolution:
@@ -167,8 +192,7 @@ class GeminiClient:
         """
         if not self.key:
             raise PipelineError("GEMINI_API_KEY is not configured.")
-        if self.unavailable:
-            raise GeminiUnavailable("Gemini was unavailable earlier in this run.")
+        self._check_run()
         body = {"systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "tools": [{"google_search": {}}],
@@ -186,6 +210,28 @@ class GeminiClient:
                 raise NotGrounded("Gemini's answer was not grounded in any web source.")
             return text, sources
         return self._request(body, parse, patient=False)
+
+    def _check_run(self):
+        if self.unavailable:
+            raise GeminiUnavailable("Gemini was unavailable earlier in this run.")
+        if _RUN["off"]:
+            raise GeminiUnavailable(f"Gemini is off for this run ({_RUN['off']}).")
+
+    def _lose(self, seconds, why=""):
+        """Account time lost to Gemini; past the run budget switch Gemini off instead of waiting."""
+        seconds = max(0.0, float(seconds))
+        budget = _wait_budget()
+        if _RUN["lost"] + seconds > budget:
+            _switch_off(f"{budget / 60:.0f} minutes already lost to quota waits and failed requests")
+            raise GeminiUnavailable(f"Gemini is off for this run ({_RUN['off']}).")
+        _RUN["lost"] += seconds
+        if why and seconds >= 1:
+            print(f"Gemini {why}; waiting {seconds:.0f} s "
+                  f"({_RUN['lost'] / 60:.1f} of {budget / 60:.0f} min budget used).", flush=True)
+
+    def _wait(self, seconds, why):
+        self._lose(seconds, why)
+        self.sleep(seconds)
 
     def _switch_model(self):
         """Every key has spent the current model's daily quota: move to the next fallback model."""
@@ -211,11 +257,14 @@ class GeminiClient:
                 self.sleep(wait)
             self._last = time.monotonic()
             response = None
+            sent = time.monotonic()
             try:
-                response = self.session.post(url, json=body, timeout=600,
+                response = self.session.post(url, json=body, timeout=REQUEST_TIMEOUT,
                                              headers={"x-goog-api-key": self.key})
             except requests.RequestException as exc:
                 last_problem = type(exc).__name__
+                self._lose(time.monotonic() - sent)
+                print(f"Gemini request failed ({last_problem}).", flush=True)
             if response is not None:
                 if response.status_code in (401, 403) and pinned:
                     raise GeminiUnavailable(f"Gemini could not read the uploaded file (HTTP {response.status_code}).")
@@ -251,6 +300,7 @@ class GeminiClient:
                         last_problem = f"unusable response ({type(exc).__name__})"
                 else:
                     last_problem = f"HTTP {response.status_code}"
+                    self._lose(time.monotonic() - sent)
                     if response.status_code == 429:
                         scope, ids = _quota(response)
                         if ids and (self.model, ids) not in self._reported:
@@ -274,6 +324,7 @@ class GeminiClient:
                                 tried = {self.index}
                                 continue
                             self.keys = list(self.all_keys)
+                            _switch_off("the daily quota is spent on every key and model")
                             break
                         if not pinned and self._next_key(tried):
                             tried.add(self.index)
@@ -286,12 +337,13 @@ class GeminiClient:
                             waits += 1
                             if waits <= MAX_QUOTA_WAITS:
                                 tried = {self.index}
-                                self.sleep(_retry_delay(response, min(waits, 6)))
+                                self._wait(_retry_delay(response, min(waits, 6)),
+                                           f"per-minute limit on every key ({self.model})")
                                 continue
             attempt += 1
             tried = {self.index}
             if attempt < MAX_ATTEMPTS:
-                self.sleep(_retry_delay(response, attempt - 1))
+                self._wait(_retry_delay(response, attempt - 1), f"retry after {last_problem}")
         if patient and not pinned:
             self.unavailable = True
         raise GeminiUnavailable(f"Gemini was unavailable after {attempt + waits} attempts: {last_problem}.")
